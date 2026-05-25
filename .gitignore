@@ -1,0 +1,6 @@
+.DS_Store
+apps/out/
+*/build/
+downloads/
+*.bin
+*.elf
