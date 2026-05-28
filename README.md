@@ -42,9 +42,9 @@ The SCSI command channel comes from ipod_sun_untethered. On a Windows PC, visit 
 
 Recommended restore path: restore the iPod using iTunes on Windows so the iPod is FAT32 formatted. Mac-formatted iPods can work, but writing to an HFS formatted iPod from Linux/Raspberry Pi is experimental.
 
-Known Issue: The SCSI command channel installed by ipod_sun_untethered can cause the iPod to panic and reboot when connected to iTunes, Apple Devices, or Finder. After restoring, disconnect the iPod from your Windows PC and connect it to your Raspberry Pi or a Linux machine.
+Known Issue: The SCSI command channel installed by ipod_sun_untethered can cause the iPod to panic and reboot when connected to iTunes, Apple Devices, or Finder. After restoring, disconnect the iPod from your Windows PC and connect it to your Raspberry Pi or a Linux machine. 
 
-If you need to sync music, restore to [stock OS](https://theapplewiki.com/wiki/Firmware/iPod#iPod_nano_(7th_generation)) from [DFU mode](https://theapplewiki.com/wiki/DFU_Mode#iPod_nano_(7th_generation)), sync music, then Shift + Click "Check for Update" and choose the [ipod_sun_untethered](https://github.com/nfzerox/ipod_sun_untethered/releases) firmware. When working on homebrew apps, connect your iPod to your Raspberry Pi or Linux machine.
+I found that if you conect it then go into disc mode when it reboots it stops rebooting and you can sync to it without bothering the iPod_Sun. Another way of syncing is to restore to [stock OS](https://theapplewiki.com/wiki/Firmware/iPod#iPod_nano_(7th_generation)) from [DFU mode](https://theapplewiki.com/wiki/DFU_Mode#iPod_nano_(7th_generation)), sync music, then Shift + Click "Check for Update" and choose the [ipod_sun_untethered](https://github.com/nfzerox/ipod_sun_untethered/releases) firmware. When working on homebrew apps, connect your iPod to your Raspberry Pi or Linux machine.
 
 ## 2. Try Sample Apps
 
