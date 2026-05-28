@@ -135,18 +135,37 @@ static bool ends_with_app(const char *s)
            s[n - 2] == 'p' && s[n - 1] == 'p';
 }
 
+static uint32_t pack4(const char *s)
+{
+    uint32_t v = 0;
+    for (int i = 0; i < 4 && s[i]; i++) {
+        v |= ((uint32_t)(uint8_t)s[i]) << (i * 8);
+    }
+    return v;
+}
+
 int hb_app_scan(hb_app_info_t *out, int max_apps)
 {
+    hb_trace_log("SCN_ENT", (uint32_t)(uintptr_t)out, (uint32_t)max_apps);
     hb_dir_t d;
-    if (!hb_fs_dir_open(&d, "/Apps", false)) return 0;
+    hb_trace_log("SCN_OPEN", 0, 0);
+    if (!hb_fs_dir_open(&d, "/Apps", false)) {
+        hb_trace_log("SCN_FAIL", 0, 0);
+        return 0;
+    }
+    hb_trace_log("SCN_OK", 0, 0);
 
     int count = 0;
+    int seen = 0;
     char name[64];
     bool is_dir = false;
 
     while (count < max_apps && hb_fs_dir_next(&d, name, sizeof name, &is_dir)) {
+        seen++;
+        hb_trace_log("SCN_NEXT", (uint32_t)seen, ((uint32_t)is_dir << 31) | pack4(name));
         if (!is_dir) continue;
         if (!ends_with_app(name)) continue;
+        hb_trace_log("SCN_APP", (uint32_t)count, pack4(name));
 
         /* Strip .app to get the base name */
         int n = my_strlen(name);
@@ -181,9 +200,11 @@ int hb_app_scan(hb_app_info_t *out, int max_apps)
             name_path[k++] = suffix[i];
         name_path[k] = 0;
 
+        hb_trace_log("SCN_NAME", (uint32_t)count, pack4(base));
         if (hb_fs_exists(name_path)) {
             char label_buf[64];
             uint32_t rd = hb_fs_read(name_path, label_buf, sizeof label_buf - 1);
+            hb_trace_log("SCN_NMRD", rd, pack4(label_buf));
             if (rd > 0) {
                 label_buf[rd] = 0;
                 /* trim trailing whitespace */
@@ -198,10 +219,16 @@ int hb_app_scan(hb_app_info_t *out, int max_apps)
         }
 
         /* Verify the exec exists, else skip */
-        if (!hb_fs_exists(a->exec)) continue;
+        hb_trace_log("SCN_EXE", (uint32_t)count, pack4(base));
+        if (!hb_fs_exists(a->exec)) {
+            hb_trace_log("SCN_SKIP", (uint32_t)count, pack4(base));
+            continue;
+        }
 
+        hb_trace_log("SCN_ADD", (uint32_t)count, hb_fs_size(a->exec));
         count++;
     }
+    hb_trace_log("SCN_DONE", (uint32_t)count, (uint32_t)seen);
     hb_fs_dir_close(&d);
     return count;
 }

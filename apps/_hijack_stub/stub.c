@@ -37,7 +37,7 @@ static void *launcher_worker(void *arg)
        may later load that trampoline while this frame is still waiting
        for hb_app_load_direct() to return. */
     hb_app_load_direct(HOMEBREW_PATH);
-    hb_trace_log("HJ_FAIL", 0, 0);
+    hb_trace_log("HJ_DONE", 0, 0);
     return (void *)0;
 }
 

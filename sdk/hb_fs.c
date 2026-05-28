@@ -44,10 +44,17 @@ bool hb_fs_exists(const char *path)
     return EXISTS_FN(path, FS_MAIN_VOLUME);
 }
 
-/* Static cache: stack-allocating this inside an app call chain can
-   overflow the task stack. Not thread-safe, which is fine for now. */
 #define FILE_CACHE_SIZE 0x1010
-static uint8_t g_fs_cache[FILE_CACHE_SIZE];
+#define FILE_CACHE_ADDR 0x09118000u
+
+/* Shared filesystem cache. Stack-allocating this inside an app call
+   chain can overflow the task stack, and the app linker folds .bss into
+   the loaded image, so a static cache would overwrite app/stub code
+   when cleared. Not thread-safe, which is fine for now. */
+static uint8_t *fs_cache(void)
+{
+    return (uint8_t *)FILE_CACHE_ADDR;
+}
 
 bool hb_fs_write(const char *path, const void *data, uint32_t size)
 {
@@ -55,10 +62,11 @@ bool hb_fs_write(const char *path, const void *data, uint32_t size)
 
     /* Wipe cache so stale data from a prior op doesn't bleed into
        the new file's deblock state. */
-    for (uint32_t i = 0; i < FILE_CACHE_SIZE; i++) g_fs_cache[i] = 0;
+    uint8_t *cache = fs_cache();
+    for (uint32_t i = 0; i < FILE_CACHE_SIZE; i++) cache[i] = 0;
 
     FILE_CTOR_C(file_obj, path, /*readOnly=*/0, FS_MAIN_VOLUME,
-                /*cacheSize=*/0x1000, /*numCaches=*/1, g_fs_cache);
+                /*cacheSize=*/0x1000, /*numCaches=*/1, cache);
 
     bool ok = false;
     if (FILE_ISOPEN(file_obj)) {
@@ -81,10 +89,11 @@ uint32_t hb_fs_read(const char *path, void *buf, uint32_t max_size)
 {
     uint8_t file_obj[FILEOBJ_SIZE];
 
-    for (uint32_t i = 0; i < FILE_CACHE_SIZE; i++) g_fs_cache[i] = 0;
+    uint8_t *cache = fs_cache();
+    for (uint32_t i = 0; i < FILE_CACHE_SIZE; i++) cache[i] = 0;
 
     FILE_CTOR_C(file_obj, path, /*readOnly=*/1, FS_MAIN_VOLUME,
-                /*cacheSize=*/0x1000, /*numCaches=*/1, g_fs_cache);
+                /*cacheSize=*/0x1000, /*numCaches=*/1, cache);
 
     uint32_t bytes_out = 0;
     if (FILE_ISOPEN(file_obj)) {

@@ -20,6 +20,7 @@
 #define APPS_PER_PAGE   (COLS * ROWS)
 #define MAX_APPS        64
 #define FOOTER_H        32
+#define EXIT_ARM_FRAMES 2000u
 
 #define BG_COLOR        HB_RGB(0x10, 0x10, 0x18)
 #define HDR_COLOR       HB_RGB(0x20, 0x20, 0x30)
@@ -45,6 +46,7 @@ static int dec_digit(int *n, int divisor)
 
 static void draw_header(void)
 {
+    hb_trace_log("LAU_HDR", (uint32_t)g_page, (uint32_t)g_total_pages);
     hb_fill_rect(0, 0, HB_SCREEN_W, HEADER_H, HDR_COLOR);
     hb_draw_str(8, 8, "Homebrew", 3, TXT_COLOR, HDR_COLOR);
 
@@ -112,7 +114,9 @@ static void draw_footer(void)
 
 static void paint(void)
 {
+    hb_trace_log("LAU_PB", (uint32_t)g_page, (uint32_t)g_n_apps);
     hb_fill_screen(BG_COLOR);
+    hb_trace_log("LAU_FILL", 0, 0);
     draw_header();
     int start = g_page * APPS_PER_PAGE;
     for (int slot = 0; slot < APPS_PER_PAGE; slot++) {
@@ -126,6 +130,7 @@ static void paint(void)
         }
     }
     draw_footer();
+    hb_trace_log("LAU_PA", (uint32_t)g_page, 0);
 }
 
 /* Hit-test region codes returned by hit() */
@@ -152,7 +157,7 @@ static int hit(int16_t tx, int16_t ty)
 
 HB_APP_ENTRY(payload_entry)
 {
-    hb_trace_reset();
+    hb_trace_init();
     hb_trace_log("LAU_BOOT", 0, 0);
 
     g_n_apps = hb_app_scan(g_apps, MAX_APPS);
@@ -195,7 +200,9 @@ HB_APP_ENTRY(payload_entry)
     uint32_t auto_tap_at = HB_AUTO_TAP;   /* frame to fire the synthetic tap */
 #endif
 
+    hb_trace_log("LAU_UINI", 0, 0);
     hb_ui_init();
+    hb_trace_log("LAU_UIOK", 0, 0);
 
     for (uint32_t frame = 0; ; frame++) {
         if (dirty) {
@@ -240,8 +247,10 @@ HB_APP_ENTRY(payload_entry)
         int16_t tx, ty;
         hb_ui_event_t e = hb_ui_poll(&tx, &ty);
         if (e == HB_UI_EXIT) {
-            hb_ui_done();
-            return;
+            hb_trace_log("LAU_QUT", frame, 0);
+            hb_trace_log("LAU_IGNX", frame, 0);
+            hb_ui_pace();
+            continue;
         }
         if (e == HB_UI_TAP) {
             int r = hit(tx, ty);

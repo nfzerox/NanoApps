@@ -308,20 +308,30 @@ static int hit_footer(int16_t tx, int16_t ty)
 
 HB_APP_ENTRY(payload_entry)
 {
+    hb_trace_init();
+    hb_trace_log("API_ENT", 0, 0);
     hb_ui_init();
+    hb_trace_log("API_UI", 0, 0);
     hb_fill_screen(BG);
 
     int page = 0;
     draw_header(page);
     draw_page_content(page);
     draw_footer(page);
+    hb_trace_log("API_DRAW", 0, 0);
 
     for (uint32_t frame = 0; ; frame++) {
         int16_t tx = 0, ty = 0;
         hb_ui_event_t e = hb_ui_poll(&tx, &ty);
-        if (e == HB_UI_EXIT) break;
+        if ((frame & 0x3ff) == 0) hb_trace_log("API_LOOP", frame, (uint32_t)e);
+        if (e == HB_UI_EXIT) {
+            hb_trace_log("API_EXIT", frame, 0);
+            break;
+        }
         if (e == HB_UI_TAP) {
             int btn = hit_footer(tx, ty);
+            hb_trace_log("API_TAP", (uint32_t)btn,
+                         ((uint32_t)(uint16_t)tx << 16) | (uint16_t)ty);
             if (btn == 0 && page > 0) {
                 page--;
                 draw_header(page);
@@ -362,4 +372,5 @@ HB_APP_ENTRY(payload_entry)
         hb_ui_pace();
     }
     hb_ui_done();
+    hb_trace_log("API_DONE", 0, 0);
 }

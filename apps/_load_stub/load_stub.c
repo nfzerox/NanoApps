@@ -20,7 +20,8 @@
  * launcher's text at 0x0867f8e4, so that return path is dead. Instead
  * the stub starts a worker, returns to the launcher, and the launcher
  * exits immediately. When the launched app later returns, the worker
- * pops back to the OS home screen and exits cleanly.
+ * exits. The filesystem cache lives outside this stub image, so the
+ * worker no longer corrupts itself during app loads.
  */
 
 #include "hb_sdk.h"
@@ -30,24 +31,12 @@
 #define PTHREAD_CREATE_ADDR  (0x080226f8u | 1u)
 #define PTHREAD_ATTR_MAGIC   0x50544841u
 #define PTHREAD_STACK_64K    0x10000u
-#define SILVER_GETINSTANCE_ADDR (0x083fb524u | 1u)
-#define SILVER_GOTO_HOME_ADDR   (0x08240ca8u | 1u)
 
 typedef void (*entry_t)(void);
 typedef int (*pthread_create_t)(uint32_t *thread, void *attr,
                                 void *(*start)(void *), void *arg);
-typedef void *(*silver_get_t)(void);
-typedef void  (*silver_home_t)(void *cntlr);
 
 static uint32_t g_attr[16];
-
-static void goto_home(void)
-{
-    void *cntlr = ((silver_get_t)SILVER_GETINSTANCE_ADDR)();
-    if (cntlr) {
-        ((silver_home_t)SILVER_GOTO_HOME_ADDR)(cntlr);
-    }
-}
 
 __attribute__((section(".text.task_entry"), used, noinline))
 static void *app_worker(void *arg)
@@ -61,7 +50,7 @@ static void *app_worker(void *arg)
         hb_trace_log("APP_FAIL", 0, 0);
     }
 
-    goto_home();
+    hb_trace_log("APP_DONE", 0, 0);
     return (void *)0;
 }
 

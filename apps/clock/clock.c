@@ -1,6 +1,6 @@
 /*
  * clock — show current date/time via the OS RTC mechanism.
- * Refreshes once per second. Whole app in a 64 KB pthread.
+ * Refreshes once per second.
  */
 
 #include "hb_sdk.h"
@@ -12,10 +12,6 @@ void *memset(void *s, int c, unsigned int n)
     for (unsigned i = 0; i < n; i++) p[i] = (uint8_t)c;
     return s;
 }
-
-#define PTHREAD_CREATE_ADDR (0x080226f8u | 1u)
-typedef int (*pthread_create_t)(uint32_t *thread, void *attr,
-                                void *(*start)(void *), void *arg);
 
 static void dec2(char *out, int v)
 {
@@ -39,6 +35,7 @@ static void dec4(char *out, int v)
 
 static void draw_time(const hb_rtc_time_t *t)
 {
+    hb_trace_log("CLK_DRAW", (uint32_t)t->hours, (uint32_t)t->minutes);
     char hms[12];
     dec2(hms,   t->hours);    hms[2] = ':';
     dec2(hms+3, t->minutes);  hms[5] = ':';
@@ -95,10 +92,12 @@ static void draw_time(const hb_rtc_time_t *t)
                 HB_RGB(0x80,0x80,0x80), HB_BLACK);
 }
 
-static void *app_main(void *arg)
+HB_APP_ENTRY(payload_entry)
 {
-    (void)arg;
+    hb_trace_init();
+    hb_trace_log("CLK_ENT", 0, 0);
     hb_ui_init();
+    hb_trace_log("CLK_UI", 0, 0);
     hb_rtc_time_t t;
     volatile uint8_t *bz = (volatile uint8_t *)&t;
     for (unsigned i = 0; i < sizeof(t); i++) bz[i] = 0;
@@ -111,27 +110,15 @@ static void *app_main(void *arg)
            so ~500 iterations between reads. */
         static uint32_t last_refresh = 0;
         if (frame == 0 || frame - last_refresh >= 500) {
+            hb_trace_log("CLK_RTC", frame, 0);
             hb_rtc_read(&t);
+            hb_trace_log("CLK_GOT", (uint32_t)t.hours, (uint32_t)t.minutes);
             draw_time(&t);
+            hb_trace_log("CLK_DOK", frame, 0);
             last_refresh = frame;
         }
         hb_ui_pace();
     }
     hb_ui_done();
-    return (void *)0;
-}
-
-HB_APP_ENTRY(payload_entry)
-{
-    static uint32_t attr[16];
-    for (int i = 0; i < 16; i++) attr[i] = 0;
-    attr[0] = 0x50544841u;
-    attr[2] = 2;
-    attr[4] = 0x10000;
-    attr[6] = 1;
-    attr[7] = 1;
-    attr[8] = 1;
-    attr[9] = 0;
-    uint32_t tid = 0;
-    ((pthread_create_t)PTHREAD_CREATE_ADDR)(&tid, attr, app_main, (void *)0);
+    hb_trace_log("CLK_DONE", 0, 0);
 }
