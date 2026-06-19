@@ -334,6 +334,9 @@ void     hb_brightness_power      (bool on);
    slideshows, now-playing, a clock. Released automatically on app switch. */
 void     hb_wake_lock             (bool on);
 
+
+void     hb_lv_set_frame_cb       (void (*cb)(void));
+
 /* ---- Settings (hb_prefs.c) ----
 
    Read/write the OS preference store. Keys are dotted strings like
