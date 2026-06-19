@@ -1,0 +1,3 @@
+--target=arm-none-eabi
+-Isdk
+-Ilvgl/include
