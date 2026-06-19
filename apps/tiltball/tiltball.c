@@ -189,13 +189,14 @@ static void on_frame(void)
 {
     if (s_dead) return;
 
+
     int32_t a[3];
     hb_accel_read_milli_g(a);
     /* tilt → acceleration: 1000 mg ≈ 1g; scale to ~0.5 px/frame²
        per mg of lateral acceleration. Inverted because the device's
        x grows in opposite direction to gravity vector for natural roll. */
     int ax_q8 = -a[0] / 8;       /* mg/8 ≈ 0..125 → modest accel */
-    int ay_q8 =  a[1] / 8;
+    int ay_q8 = -a[1] / 8;
 
     s_vx_q8 += ax_q8;
     s_vy_q8 += ay_q8;
@@ -259,6 +260,10 @@ HB_APP_ENTRY(payload_entry)
 {
     hb_trace_init();
     s_rng = hb_time_uptime_us() | 1u;
+   
+    // we dont want the device to fall asleep while playing.
+    // seems to get reset when going to the homescreen.
+    hb_wake_lock(true);
 
     lv_obj_t *scr = lv_screen_active();
     lv_obj_set_style_bg_color(scr, lv_color_hex(hb_color_bg()), 0);
