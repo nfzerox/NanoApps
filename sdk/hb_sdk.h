@@ -334,8 +334,11 @@ void     hb_brightness_power      (bool on);
    slideshows, now-playing, a clock. Released automatically on app switch. */
 void     hb_wake_lock             (bool on);
 
-
+/* ---- Optional pre-render hook: resident calls this each OS-timer tick*/
 void     hb_lv_set_frame_cb       (void (*cb)(void));
+/* Optional post-render hook: runs AFTER lv_timer_handler the last
+   thing to touch the framebuffer before the resident composites it */
+void     hb_lv_set_post_cb        (void (*cb)(void));
 
 /* ---- Settings (hb_prefs.c) ----
 
