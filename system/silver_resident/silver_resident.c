@@ -1218,11 +1218,32 @@ HB_APP_ENTRY(payload_entry)
         hb_silver_icon_rearm();
     else
         hb_silver_icon_reset_resolver();
-    /* stop a heartbeat timer left armed by a previous deploy — its callback now
-     * points into overwritten resident code. */
-    if (*(uint32_t *)TIMER_MAGIC_ADDR == TIMER_MAGIC) {
-        ((timer1_t)(A_TIMER_STOP | 1u))((void *)TIMER_ADDR);
-        *(uint32_t *)TIMER_MAGIC_ADDR = 0;
+        /* stop a heartbeat timer left armed by a previous deploy — its callback now
+     * points into overwritten resident code.
+     *
+     * Only if that deploy was in THIS boot. The magic and the OS timer object live
+     * in resident DRAM, which survives a DRAM-preserving reboot (a force restart,
+     * or a panic) — e.g. when the iPod restarts while an app is on screen, before
+     * hb_surface_stop_timer runs. The OS event server the timer was registered with
+     * does NOT survive: the object's links point into the previous boot's state, and
+     * A_TIMER_STOP on it never returns. This entry runs inside the SCSI exec, so the
+     * whole USB interface then hangs (the host resets the device every 10-30 s) and,
+     * since the magic survives every further force restart, every later deploy hangs
+     * the same way until DRAM is cleared.
+     *
+     * Same boot <=> our home dispatch hook is still installed: the OS image (and the
+     * vtable we patch) is reloaded on every boot, cold or DRAM-preserving — the same
+     * fact action_hook relies on for "full patch on a fresh boot" (GETRES_PROLOGUE0).
+     * Read it BEFORE re-hooking below. A stale timer is just forgotten. */
+    {
+        uint32_t disp = *(uint32_t *)(uintptr_t)(HB_SILVER_HOME_VTABLE + HB_SILVER_HOME_DISPATCH_SLOT);
+        int same_boot = disp >= 0x09130000u && disp < 0x09140000u;
+        if (*(uint32_t *)TIMER_MAGIC_ADDR == TIMER_MAGIC) {
+            if (same_boot)
+                ((timer1_t)(A_TIMER_STOP | 1u))((void *)TIMER_ADDR);
+            *(uint32_t *)TIMER_MAGIC_ADDR = 0;
+            hb_trace_log("TIMRCLR ", (uint32_t)same_boot, disp);
+        }
     }
     /* s_gfx_ready / s_fb live in .bss (zeroed at entry), so the custom-draw surface is
      * rebuilt — and the framebuffer re-allocated from the heap — this deploy. */
