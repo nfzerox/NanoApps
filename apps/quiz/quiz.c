@@ -14,7 +14,7 @@
  *   A: 8
  *
  * Built-in deck "General Knowledge" ships with the binary; the user
- * can drop additional .txt deck files at /Apps/Data/Quiz/decks/.
+ * can drop additional .txt deck files at /Data/Quiz/decks/.
  */
 #include "hb_sdk.h"
 #include "hb_prefs.h"
@@ -23,8 +23,8 @@
 #define MAX_DECKS    16
 #define MAX_Q        128
 #define MAX_TEXT     128
-#define DATA_DIR     "/Apps/Data/Quiz"
-#define DECKS_DIR    "/Apps/Data/Quiz/decks"
+#define DATA_DIR     "/Data/Quiz"
+#define DECKS_DIR    "/Data/Quiz/decks"
 
 typedef struct {
     const char *q;
@@ -445,7 +445,7 @@ static void build_results(void)
 HB_APP_ENTRY(payload_entry)
 {
     hb_trace_init();
-    hb_fs_mkdir("/Apps/Data");
+    hb_fs_mkdir("/Data");
     hb_fs_mkdir(DATA_DIR);
     hb_fs_mkdir(DECKS_DIR);
     load_all_decks();

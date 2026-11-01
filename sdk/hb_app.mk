@@ -14,6 +14,11 @@
 #     LINK_VA  ?= 0x0867f8e4
 #     EXTRA_CFLAGS ?=
 #     LVGL_ENABLE ?= 0       (1 = link LVGL + integration layer)
+#     HB_CODE_MODE ?= thumb   (thumb or arm)
+#     HB_FLOAT_ABI ?= soft    (soft keeps Thumb code free of FP instructions)
+#     HB_FPU ?= neon
+#     CHECK_NO_THUMB_FP ?= 0  (1 = reject VFP/NEON in every Thumb region)
+#     THUMB_FP_ALLOW ?=       (diagnostic-only exact function allowlist)
 
 SDK_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 REPO_DIR := $(abspath $(SDK_DIR)/..)
@@ -45,7 +50,9 @@ SDK_SRCS := \
     $(SDK_DIR)/hb_record.c \
     $(SDK_DIR)/hb_sysfx.c \
     $(SDK_DIR)/hb_trace.c \
+    $(SDK_DIR)/hb_shared.c \
     $(SDK_DIR)/hb_time.c \
+    $(SDK_DIR)/hb_fpu.c \
     $(SDK_DIR)/hb_silver_app.c \
     $(SDK_DIR)/hb_silver_res.c \
     $(SDK_DIR)/hb_silver_uitask.c \
@@ -54,12 +61,14 @@ SDK_SRCS := \
     $(SDK_DIR)/hb_compositor.c \
     $(SDK_DIR)/gl.c \
     $(SDK_DIR)/hb_reloc.c \
+    $(SDK_DIR)/hb_reloc_file.c \
     $(SDK_DIR)/hb_app_bundle.c
 
 CC      := arm-none-eabi-gcc
 OBJCOPY := arm-none-eabi-objcopy
 SIZE    := arm-none-eabi-size
 AR      := arm-none-eabi-ar
+PYTHON  ?= python3
 
 LVGL_ENABLE ?= 0
 # LV_SURFACE := 1 — a fixed-VA LVGL Silver-app (hb_lv_surface runtime + the
@@ -132,8 +141,16 @@ LINK_VA ?= 0x09280000
 # heap) for coexist binaries that run alongside the OS.
 BSS_VA ?= 0x09200000
 
+HB_CODE_MODE ?= thumb
+HB_FLOAT_ABI ?= soft
+HB_FPU ?= neon
+CHECK_NO_THUMB_FP ?= 0
+THUMB_FP_ALLOW ?=
+HB_ARCH_FLAGS ?= -mcpu=cortex-a8 -m$(HB_CODE_MODE) \
+                 -mfloat-abi=$(HB_FLOAT_ABI) -mfpu=$(HB_FPU)
+
 CFLAGS := \
-    -mcpu=cortex-a8 -mthumb -mfpu=neon \
+    $(HB_ARCH_FLAGS) \
     -fno-pic -fno-builtin -ffreestanding -nostdlib \
     -fno-jump-tables -fno-common -fno-exceptions \
     -Os -Wall -Wextra -fdata-sections -ffunction-sections \
@@ -150,7 +167,7 @@ LDFLAGS := -Wl,--gc-sections -Wl,--build-id=none \
 # __aeabi_lmul, etc). The basic SDK rarely needs them, but anything
 # touching division or 64-bit math (notably LVGL) does. Linking libgcc
 # after -nostdlib gets the helpers without pulling in libc.
-LIBGCC := $(shell $(CC) -mcpu=cortex-a8 -mthumb -mfpu=neon -print-libgcc-file-name)
+LIBGCC := $(shell $(CC) $(HB_ARCH_FLAGS) -print-libgcc-file-name)
 LDLIBS := $(LIBGCC)
 
 ifeq ($(LVGL_ENABLE),1)
@@ -226,7 +243,8 @@ BUILD := build
 # mkrelocapp can extract the ABS32 reloc offsets; entry = payload_entry; no
 # fixed-VA linker script. Everything else links fixed-VA to a flat .bin.
 ifeq ($(RELOC),1)
-  RELOC_LDFLAGS := -mcpu=cortex-a8 -mthumb -mfpu=neon -nostdlib \
+  CFLAGS += -mword-relocations
+  RELOC_LDFLAGS := $(HB_ARCH_FLAGS) -nostdlib \
                    -Wl,--gc-sections -Wl,--build-id=none \
                    -Wl,-q -Wl,-e,payload_entry -Wl,-Ttext,0
   APP_OUT := $(BUILD)/$(APP_NAME).hbapp
@@ -252,8 +270,12 @@ $(LVGL_AR): $(LVGL_OBJS)
 	@$(AR) crs $@ $^
 endif
 
-$(BUILD)/$(APP_NAME).elf: $(SRCS) $(SDK_SRCS) $(LDLIBS_LVGL) $(SDK_DIR)/hb_sdk.h $(SDK_DIR)/hb_app.ld | $(BUILD)
+$(BUILD)/$(APP_NAME).elf: $(SRCS) $(SDK_SRCS) $(LDLIBS_LVGL) $(wildcard $(SDK_DIR)/*.h) $(wildcard *.h) $(SDK_DIR)/hb_app.ld $(REPO_DIR)/tools/check_no_thumb_fp.py | $(BUILD)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(SRCS) $(SDK_SRCS) $(LDLIBS_LVGL) $(LDLIBS)
+	@if [ "$(CHECK_NO_THUMB_FP)" = "1" ]; then \
+		$(PYTHON) $(REPO_DIR)/tools/check_no_thumb_fp.py \
+			$(foreach s,$(THUMB_FP_ALLOW),--allow-symbol $(s)) $@; \
+	fi
 	@$(SIZE) $@
 	@echo "linked at $(LINK_VA)"
 
@@ -264,12 +286,16 @@ $(BUILD)/$(APP_NAME).bin: $(BUILD)/$(APP_NAME).elf
 
 # Relocatable surface blob: link base-0 (-Wl,-q keeps relocations), then
 # mkrelocapp flattens the image + emits the ABS32 reloc table as a .hbapp.
-$(BUILD)/$(APP_NAME).reloc.elf: $(SRCS) $(SDK_SRCS) $(LDLIBS_LVGL) $(SDK_DIR)/hb_sdk.h | $(BUILD)
+$(BUILD)/$(APP_NAME).reloc.elf: $(SRCS) $(SDK_SRCS) $(LDLIBS_LVGL) $(wildcard $(SDK_DIR)/*.h) $(wildcard *.h) $(REPO_DIR)/tools/check_no_thumb_fp.py | $(BUILD)
 	$(CC) $(CFLAGS) $(RELOC_LDFLAGS) -o $@ $(SRCS) $(SDK_SRCS) $(LDLIBS_LVGL) $(LDLIBS)
+	@if [ "$(CHECK_NO_THUMB_FP)" = "1" ]; then \
+		$(PYTHON) $(REPO_DIR)/tools/check_no_thumb_fp.py \
+			$(foreach s,$(THUMB_FP_ALLOW),--allow-symbol $(s)) $@; \
+	fi
 	@$(SIZE) $@
 
 $(BUILD)/$(APP_NAME).hbapp: $(BUILD)/$(APP_NAME).reloc.elf
-	python3 $(REPO_DIR)/tools/mkrelocapp.py $< $@ payload_entry
+	$(PYTHON) $(REPO_DIR)/tools/mkrelocapp.py $< $@ payload_entry
 	@echo "=== $@ ===" && wc -c $@
 
 inspect: $(BUILD)/$(APP_NAME).elf

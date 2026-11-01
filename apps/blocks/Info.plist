@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>	<string>org.nanoapps.blocks</string>
+	<key>CFBundleName</key>		<string>Blocks</string>
+	<key>CFBundleExecutable</key>	<string>blocks</string>
+	<key>HBAppKind</key>			<integer>2</integer>
+	<key>HBIconGlyph</key>		<string>cube</string>
+	<key>HBIconColor</key>		<string>#5fa034</string>
+</dict>
+</plist>

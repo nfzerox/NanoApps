@@ -26,8 +26,9 @@
 #define BOARD_H (ROWS * CELL_PX)      /* 168 */
 #define HEADER_H 40
 
-#define CANVAS_BUF_ADDR  0x092E0000u
-static uint8_t * const s_canvas_buf = (uint8_t *)CANVAS_BUF_ADDR;
+/* In the app's own arena: the old fixed 0x092E0000 lies inside the OS heap
+ * and was overwriting live objects (and sometimes this app's own code). */
+static uint8_t s_canvas_buf[BOARD_W * BOARD_H * 4] __attribute__((aligned(4)));
 
 /* Each tile: -1 = removed, else 0..23 = pair id. */
 static int8_t s_board[ROWS][COLS];

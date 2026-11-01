@@ -14,6 +14,7 @@
 #define ADDR_SB_MODEL    0x084084b4u
 #define ADDR_SB_REGISTER 0x08498e68u
 #define ADDR_SB_SHOW     0x0849a3dcu
+#define ADDR_SB_HIDE     0x08499e68u  /* paired show/hide virtual slots +0x134/+0x138 */
 #define ADDR_STR_CTOR    0x0842d8bcu
 #define ADDR_SB_VIEW     0x083f4dfcu   /* read the current springboard view (or NULL)         */
 #define SBVIEW_TABLE_OFF 0x388u        /* springboard view: table-view field offset */
@@ -116,6 +117,35 @@ void hb_silver_home_add_item(const char *sbid, int label_id, int image_id)
     for (i = 0; sbid[i] && i < 120; i++)
         show[2 + i] = (uint8_t)sbid[i];
     ((sb_show_t)FN_THUMB(ADDR_SB_SHOW))(model, show);
+}
+
+void hb_silver_home_hide_item(const char *sbid)
+{
+    void *model = ((get_ptr_t)FN_THUMB(ADDR_SB_MODEL))();
+    uint8_t data[160] = {0};
+    int i;
+    if (!model || !sbid) return;
+    for (i = 0; sbid[i] && i < 120; i++) data[2 + i] = (uint8_t)sbid[i];
+    ((sb_show_t)FN_THUMB(ADDR_SB_HIDE))(model, data);
+}
+
+void hb_silver_resdb_unpublish(void *node_storage)
+{
+    void *model = ((get_ptr_t)FN_THUMB(ADDR_RES_MODEL))();
+    uint32_t *end, *n, *target = node_storage;
+    if (!model || !target) return;
+    end = *(uint32_t **)((char *)model + RESDB_CHAIN_OFF);
+    if (!end) return;
+    for (n = (uint32_t *)(uintptr_t)end[0]; n && n != end;
+         n = (uint32_t *)(uintptr_t)n[0]) {
+        if (n == target) {
+            uint32_t *next = (uint32_t *)(uintptr_t)n[0];
+            uint32_t *prev = (uint32_t *)(uintptr_t)n[1];
+            next[1] = n[1]; prev[0] = n[0];
+            n[0] = n[1] = 0;
+            return;
+        }
+    }
 }
 
 void hb_silver_home_reload(void)

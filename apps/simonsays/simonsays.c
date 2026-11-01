@@ -17,8 +17,8 @@
 #define MAX_SEQ      200
 #define FLASH_MS     350u
 #define BETWEEN_MS   180u
-#define BEST_PATH    "/Apps/Data/SimonSays/best.txt"
-#define DATA_DIR     "/Apps/Data/SimonSays"
+#define BEST_PATH    "/Data/SimonSays/best.txt"
+#define DATA_DIR     "/Data/SimonSays"
 
 static int     s_seq[MAX_SEQ];
 static int     s_seq_len = 0;
@@ -209,7 +209,7 @@ static void on_frame(void)
 HB_APP_ENTRY(payload_entry)
 {
     hb_trace_init();
-    hb_fs_mkdir("/Apps/Data");
+    hb_fs_mkdir("/Data");
     hb_fs_mkdir(DATA_DIR);
     load_best();
     s_rng = hb_time_uptime_us() | 1u;

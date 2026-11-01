@@ -32,4 +32,39 @@
 void *hb_reloc_load(const void *packed, void *(*alloc)(uint32_t size),
                     void **out_arena);
 
+/*
+ * Load + relocate the .hbapp FILE at `path` straight into its own OS-heap block
+ * (hb_reloc_file.c): the file is read to the top of the block, then moved down,
+ * rebased and its bss zeroed, so nothing outside the block is ever written.
+ * Returns the thumb entry, or NULL (arena freed) on any failure. *out_arena gets
+ * the allocation to free later; *out_len the file size (0 if the file is missing
+ * or not relocatable). If `out_base`/`out_span` are non-NULL they receive the
+ * image's rebased base address and its span (image + bss) in bytes.
+ */
+void *hb_reloc_load_file(const char *path, void **out_arena, uint32_t *out_len,
+                         uint8_t **out_base, uint32_t *out_span);
+/* Verify standalone app bytes against the manifest before publishing code. */
+void *hb_reloc_load_file_verified(const char *path, void **out_arena, uint32_t *out_len,
+                                  uint32_t expected_hash);
+
+/* Checked resident image. The on-disk file is one canonical HRL1 image followed
+ * by a little-endian FNV-1a checksum of every preceding byte. This is an
+ * accidental-corruption check, not authentication. The loader validates the
+ * complete relocation table before changing executable bytes. */
+void *hb_reloc_load_file_checked(const char *path, void **out_arena,
+                                 uint32_t *out_len, uint8_t **out_base,
+                                 uint32_t *out_span, uint32_t *out_image_size);
+
+/* Versioned resident from the selected filesystem volume (disk = 0).
+ * HBVR/ABI/firmware/source-timestamp metadata is covered by the slot checksum.
+ * Legacy checksummed slots report version zero. No resident code is executed. */
+void *hb_reloc_load_file_checked_at(const char *path, int volume,
+                                    void **out_arena, uint32_t *out_len,
+                                    uint8_t **out_base, uint32_t *out_span,
+                                    uint32_t *out_image_size, uint32_t *out_version);
+/* Last file-load validation step (high byte) and length (low 24 bits).
+ * 0=valid, 1=missing/header read, 2=layout, 3=allocation, 4=read, 5=changed
+ * header, 6=checksum, 7=ABI/firmware/version, 8=relocations. UI-task serialized. */
+uint32_t hb_reloc_file_status(void);
+
 #endif /* HB_RELOC_H */

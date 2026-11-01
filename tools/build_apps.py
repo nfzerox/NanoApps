@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """Build the homebrew /Apps image for the relocatable LVGL surface model.
 
-The staging tree under /tmp/hbapps mirrors the device 1:1 (it IS the /Apps
-image), so install is a plain recursive copy. Apps are ordered alphabetically by
-CFBundleName — the pack order, icon-id assignment and the k-th icon file all
-follow it, so the on-disk order is derivable from the names alone.
+Each app lives in /Apps/<Display Name>.nanoapp/ with manifest.napp, app.hbapp and icon.bin.
+The same folder is used for developer installs and independently shared ZIPs.
+Each manifest is complete; no shared catalog is generated.
 
 For every app that builds (apps/<name>/build/<name>.hbapp):
   - generate a 112x112 home icon (glossy 90x90 color disc + white FontAwesome
-    glyph, OS-sampled palette) -> /tmp/hbapps/Apps/Icons/<CFBundleName>.bin,
-  - copy the relocatable blob -> /tmp/hbapps/Apps/Executables/<CFBundleName>.hbapp,
+    glyph, OS-sampled palette) -> /tmp/hbapps/Apps/<Display Name>.nanoapp/icon.bin,
+  - copy the relocatable blob -> /tmp/hbapps/Apps/<Display Name>.nanoapp/app.hbapp,
   - make a bundle (label + a SHARED custom screen; NO icon/code section — those
-    are separate disk files) and pack them all into Apps/AllApps.pack.
+    are separate disk files) with compatibility metadata in manifest.napp.
 
 Everything we install lives under /Apps — nothing of ours is written to
 /iPod_Control.
@@ -36,8 +35,8 @@ HBLAYOUT = 229474305        # HBCustom_Layout (0x0dad8001)
 HBAP = 0x48426170     # 'HBap' label chain tag
 HBSD = 0x48425344     # 'HBSD' screen chain tag
 
-# Per-app metadata now lives next to each app in apps/<name>/Info.plist (the same
-# file that ships in the on-device bundle and the resident parses). Keys:
+# Source metadata lives next to each app in apps/<name>/Info.plist and is compiled
+# into its on-device manifest. Keys:
 #   CFBundleIdentifier  stable bundle id (identity)
 #   CFBundleName        home-screen label
 #   CFBundleExecutable  executable name
@@ -96,6 +95,14 @@ CIRC_X0, CIRC_Y0, CIRC_W, CIRC_H = 12, 6, 88, 89
 CIRC_X1, CIRC_Y1 = CIRC_X0 + CIRC_W, CIRC_Y0 + CIRC_H
 
 
+def app_path(name):
+    for tree in ('apps', 'harnesses'):
+        folder = ROOT / tree / name
+        if (folder / 'Info.plist').is_file():
+            return folder
+    raise ValueError(f'no packaged app target: {name}')
+
+
 def nice(name):
     return name.replace("_", " ").title()[:23]
 
@@ -117,13 +124,15 @@ def load_meta(app, i):
         "kind":      1,
         "glyph":     GLYPH.get(app, GLYPH["_default"]),
         "color":     fb_color,
+        "minimum_resident": 0,
     }
-    p = ROOT / "apps" / app / "Info.plist"
+    p = app_path(app) / "Info.plist"
     if p.exists():
         d = plistlib.loads(p.read_bytes())
         meta["bundle_id"] = d.get("CFBundleIdentifier", meta["bundle_id"])
         meta["label"]     = d.get("CFBundleName", meta["label"])[:23]
         meta["kind"]      = int(d.get("HBAppKind", meta["kind"]))
+        meta["minimum_resident"] = int(d.get("HBMinimumResidentVersion", 0))
         meta["glyph"]     = d.get("HBIconGlyph", meta["glyph"])
         meta["color"]     = hex_rgb(d.get("HBIconColor", ""), fb_color)
     return meta
@@ -135,25 +144,6 @@ LABELS_FALLBACK = {"agl": "AGL"}
 # (folder names don't change), unique, and never a bare number. No registry file.
 def sbid_for(app_dir):
     return "hb." + app_dir
-
-# app_id doubles as the home-label resource id. It must be a UNIQUE integer >=
-# OUR_ID_BASE (0x0dad8000) and clear of the screen/layout ids (0x0dad8001/2) — an
-# internal OS resource id, not a device-facing identifier. Derive it stably from
-# the bundle id with an FNV-1a hash + linear probe (deterministic, sorted), so no
-# committed slot registry is needed.
-def assign_app_ids(bundle_ids):
-    LO, HI = 0x0dad8100, 0x0dadff00          # clear of 0x0dad8001/2
-    span = HI - LO
-    used, out = set(), {}
-    for bid in sorted(bundle_ids):
-        h = 0x811c9dc5
-        for ch in bid.encode():
-            h = ((h ^ ch) * 0x01000193) & 0xffffffff
-        x = LO + (h % span)
-        while x in used:
-            x = LO + ((x - LO + 1) % span)
-        used.add(x); out[bid] = x
-    return out
 
 def _scale(rgb, f):
     return tuple(max(0, min(255, int(c * f))) for c in rgb)
@@ -169,7 +159,7 @@ def _glyph_mask(fa_name, px):
     d.text((-bb[0], -bb[1]), cp, font=font, fill=255)
     return big.crop((0, 0, max(1, bb[2] - bb[0]), max(1, bb[3] - bb[1])))
 
-def make_png(fa_name, rgb, path):
+def make_png(fa_name, rgb, path, art=None):
     """Glossy circular springboard icon. Rendered 4x supersampled and downsampled
     so the disc border + glyph edges are cleanly anti-aliased; centred disc; a
     defined top-gloss highlight with a crisp lower edge."""
@@ -222,6 +212,17 @@ def make_png(fa_name, rgb, path):
     gloss = Image.new("RGBA", (S, S), (255, 255, 255, 0)); gloss.putalpha(ga)
     img = Image.alpha_composite(img, gloss)
 
+    # Logo art (apps/<name>/icon_art.png, RGBA): fitted inside the disc in place of a
+    # glyph, over the gloss so the logo keeps its own colours.
+    if art is not None:
+        aw, ah = art.size
+        sc = min(dw * 0.94 / aw, dh * 0.74 / ah)
+        a2 = art.resize((max(1, int(aw * sc)), max(1, int(ah * sc))), Image.LANCZOS)
+        layer = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+        layer.paste(a2, (x0 + (dw - a2.size[0]) // 2, y0 + (dh - a2.size[1]) // 2 + SS), a2)
+        layer.putalpha(ImageChops.multiply(layer.getchannel("A"), mask))
+        img = Image.alpha_composite(img, layer)
+
     # 1px inner border at 25% black — drawn WITHIN the disc edge (over the color),
     # so it reads as a darkened rim rather than an outside stroke.
     bw = SS                                                   # 1px final
@@ -234,6 +235,9 @@ def make_png(fa_name, rgb, path):
 
     # white glyph, centred in the disc, with a faint thin outline (no drop shadow):
     # a ~0.5px dark ring at 20% alpha for just enough edge definition.
+    if art is not None:
+        img.resize((SIZE, SIZE), Image.LANCZOS).save(path)
+        return
     gm = _glyph_mask(fa_name, int(dw * 0.50))
     gw, gh = gm.size
     gx, gy = x0 + (dw - gw) // 2, y0 + (dh - gh) // 2
@@ -266,23 +270,18 @@ def build_screens():
                     str(ROOT / "tools" / "hb_silverdb.bin")], check=True)
 
 
-def main(apps):
+def main(apps, out=None):
     # Regenerate the surface screen DB from the source screens (tools/screens/)
     # so the dim/no-dim screens always match the committed source.
     if (ROOT / "tools" / "screens").is_dir():
         build_screens()
-    # Clean slate. The staging tree under /tmp/hbapps mirrors the device 1:1 — it
-    # IS the /Apps image (AllApps.pack + Executables/ + Icons/), so install is a
-    # plain recursive copy, no rename/remap. Build scratch (intermediate .app
-    # bundles, icon db) lives in a SEPARATE dir so it never ships.
+    # Build each distributable folder from scratch; the temporary .app metadata
+    # and combined staging index are build inputs, not public bundle contents.
     import shutil as _sh, tempfile
-    out = Path("/tmp/hbapps")
+    out = Path(out) if out is not None else Path("/tmp/hbapps")
     _sh.rmtree(out, ignore_errors=True)
     appsd  = out / "Apps"            # == device /Apps
-    execd  = appsd / "Executables"  # == device /Apps/Executables/<CFBundleName>.hbapp
-    iconsd = appsd / "Icons"        # == device /Apps/Icons/<CFBundleName>.bin
-    execd.mkdir(parents=True, exist_ok=True)
-    iconsd.mkdir(parents=True, exist_ok=True)
+    appsd.mkdir(parents=True, exist_ok=True)
     # Throwaway scratch: the intermediate .app bundles + icon SilverDB that mkapp.py
     # (bundle->pack) and pack_silverdb hand off through files. Auto-deleted at the
     # end — nothing here ships, and it shouldn't linger to confuse the /Apps tree.
@@ -295,15 +294,14 @@ def main(apps):
         apps = sorted(d.name for d in (ROOT / "apps").iterdir()
                       if (d / "build" / f"{d.name}.hbapp").exists())
     # keep only real surface apps (exclude the resident etc.)
-    apps = [a for a in apps if (ROOT / "apps" / a / "build" / f"{a}.hbapp").exists()
+    apps = [a for a in apps if (app_path(a) / "build" / f"{a}.hbapp").exists()
             and a != "silver_resident"]
 
     # per-app metadata (Info.plist next to each app, table fallback otherwise)
     metas = [load_meta(a, i) for i, a in enumerate(apps)]
 
-    # Canonical order = alphabetical by CFBundleName. Everything downstream (pack
-    # order, icon id assignment, the k-th icon file) follows this, so the on-disk
-    # icon/exe order is derivable from the names alone — no separate ordering file.
+    # Keep staging and icon generation deterministic; the resident discovers
+    # app folders independently and sorts their names at runtime.
     order = sorted(range(len(apps)), key=lambda i: metas[i]["label"].lower())
     apps  = [apps[i]  for i in order]
     metas = [metas[i] for i in order]
@@ -313,8 +311,11 @@ def main(apps):
     # the Info.plist glyph + color.
     for i, a in enumerate(apps):
         dst = icons_src / f"{ICON_BASE_ID + i}_{FMT:04x}.png"
-        custom = ROOT / "apps" / a / "icon.png"
-        if custom.exists():
+        custom = app_path(a) / "icon.png"
+        art = app_path(a) / "icon_art.png"
+        if art.exists():
+            make_png(None, metas[i]["color"], dst, art=Image.open(art).convert("RGBA"))
+        elif custom.exists():
             Image.open(custom).convert("RGBA").resize((SIZE, SIZE), Image.LANCZOS).save(dst)
         else:
             make_png(metas[i]["glyph"], metas[i]["color"], dst)
@@ -329,36 +330,41 @@ def main(apps):
         ln = struct.unpack_from("<I", data, 28 + k * 12 + 8)[0]
         icon_blobs.append(data[ds + off:ds + off + ln])
 
-    # Lazy serving: write each icon straight to the shipped file
-    # /Apps/Icons/<bundle-name>.bin (each bitmap is exactly what
-    # pack_silverdb emits above). The resident registers the ids empty + serves
-    # them on demand from these files (not held in heap / the pack); the resolver
-    # maps the k-th cache id to the k-th app's name.
+    # Icons are read lazily from their app folders, keeping resident heap bounded.
+    from package_app import manifest_for, validate_folder
+    folder_names = [validate_folder(m['label'] + '.nanoapp') for m in metas]
+    if len({n.casefold() for n in folder_names}) != len(folder_names):
+        raise ValueError('app folder names collide on FAT; choose distinct CFBundleName values')
+    if len({m['bundle_id'] for m in metas}) != len(metas) or len(set(apps)) != len(apps):
+        raise ValueError('duplicate app identity')
     for i in range(len(apps)):
-        (iconsd / f"{metas[i]['label']}.bin").write_bytes(icon_blobs[i])
+        folder = appsd / folder_names[i]
+        folder.mkdir()
+        (folder / 'icon.bin').write_bytes(icon_blobs[i])
 
-    # 2. bundles (label + screen ref only) + copy each blob to
-    #    Apps/Executables/<CFBundleName>.hbapp
+    # 2. bundles (label + screen ref only) + per-app executable.
     #
     # Contract enforced by the resident (silver_resident.c):
     #   - label-id / app-id MUST be >= OUR_ID_BASE (0x0dad8000) or getres_hook
     #     passes the id through to the master DB and the springboard resolves it
-    #     to a STOCK string (we saw "%d Photos"/"%d Events"). assign_app_ids keeps
-    #     them in [0x0dad8100, 0x0dadff00), clear of the screen/layout ids.
-    #   - sbid is "hb.<folder>" (assign_app_ids' sibling sbid_for) — a stable,
+    #     to a STOCK string. Independent IDs stay in [0x10000000, 0x20000000).
+    #   - sbid is "hb.<folder>" (sbid_for) — a stable,
     #     unique, NON-numeric springboard identity. The OS persists home-screen
     #     reorder keyed by sbid, so a name-based sbid keeps an app's position across
     #     other apps being added/removed. The tap router matches it by STRING.
-    #   - the launch path uses CFBundleName: the resident reads the blob from
-    #     /Apps/Executables/<CFBundleName>.hbapp and the icon from
-    #     /Apps/Icons/<CFBundleName>.bin, so both files are named to match.
-    app_ids = assign_app_ids([m["bundle_id"] for m in metas])
-    bundles = []
+    #   - stable SBID remains inside metadata; folder names use the display label.
+    # Independent authors need no shared registry or collision-probe order.
+    # The resident rejects any collision before registering the app.
+    import hashlib
+    app_ids = {m['bundle_id']: 0x10000000 | (int.from_bytes(
+        hashlib.sha256(m['bundle_id'].encode()).digest()[:4], 'little') & 0x0fffffff)
+        for m in metas}
     mapping = []
     for i, a in enumerate(apps):
         app_id = app_ids[metas[i]["bundle_id"]]
         sbid = sbid_for(a)
         label = metas[i]["label"]
+        key = sbid
         # The resident copies sbid/name into 24-byte launch-record fields (cap 23).
         # Fail loudly here rather than silently truncate (which would break tap
         # routing). label is already capped at 23 by load_meta.
@@ -367,32 +373,30 @@ def main(apps):
         appf = scratch / f"{a}.app"
         subprocess.run(["python3", str(ROOT / "tools" / "mkapp.py"), "bundle",
             str(appf), "--id", hex(app_id), "--kind", str(metas[i]["kind"]),
-            "--sbid", sbid, "--name", label,
+            "--sbid", sbid, "--name", key,
             "--label-id", hex(app_id), "--label-tag", hex(HBAP), "--label-text", label,
             "--screen-id", str(HBSCREEN), "--layout-id", str(HBLAYOUT),
             "--screen-tag", hex(HBSD), "--screen", str(SCREEN)],
             check=True, stdout=subprocess.DEVNULL)
-            # NOTE: no --icon — icons are served lazily from /Apps/Icons/
-        bundles.append(str(appf))
-        # device executable = the relocatable .hbapp blob (resident hb_reloc-loads
-        # it into an operator-new arena), named by CFBundleName so the launch path
-        # /Apps/Executables/<CFBundleName>.hbapp reads it directly.
-        binsrc = ROOT / "apps" / a / "build" / f"{a}.hbapp"
-        (execd / f"{label}.hbapp").write_bytes(binsrc.read_bytes())
+            # NOTE: no --icon — icons are served lazily from each app folder.
+        # Publish the manifest after its executable and icon have been staged.
+        binsrc = app_path(a) / "build" / f"{a}.hbapp"
+        (appsd / folder_names[i] / 'app.hbapp').write_bytes(binsrc.read_bytes())
+        (appsd / folder_names[i] / 'manifest.napp').write_bytes(manifest_for(
+            appf.read_bytes(), binsrc.read_bytes(), icon_blobs[i], metas[i]['minimum_resident']))
         mapping.append(f"{label}({sbid})")
 
-    # 3. pack — the single manifest the resident reads (app identity + order)
-    pack = appsd / "AllApps.pack"
-    subprocess.run(["python3", str(ROOT / "tools" / "mkapp.py"), "pack",
-                    str(pack)] + bundles, check=True)
-    print(f"packed {len(apps)} apps -> {pack} ({pack.stat().st_size} bytes); "
-          f"exes in {execd}, icons in {iconsd}")
+    print(f"staged {len(apps)} app folders -> {appsd}")
     print("  " + "  ".join(mapping))
     # NOTE: per-app data lives in the repo's top-level data/<Name>/ (PascalCase,
-    # matching each app's /Apps/Data/<Name> path) and is copied to the device on
+    # matching each app's /Data/<Name> path) and is copied to the device on
     # demand by `nano deploy --data` (skip-existing, so user edits survive) — never
     # wiped by a normal app deploy (see nano's _install_disk).
     _sh.rmtree(scratch, ignore_errors=True)   # drop build scratch; only Apps/ ships
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('apps', nargs='*')
+    args = parser.parse_args()
+    main(args.apps)

@@ -1,0 +1,2 @@
+# Preserve upstream patch context and checksum-pinned vendor source verbatim.
+ports/*/*.patch -whitespace

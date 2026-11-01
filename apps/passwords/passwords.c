@@ -5,7 +5,7 @@
  * TOTP secret. When a secret is present, the detail view shows the
  * current 6-digit RFC 6238 code with a 30-second countdown ring.
  *
- * Storage (plaintext): /Apps/Data/Passwords/items.txt — one entry
+ * Storage (plaintext): /Data/Passwords/items.txt — one entry
  * per line, tab-separated: site\tusername\tpassword\tsecret_b32
  *
  * No encryption in v1 — the device's own filesystem isn't network-
@@ -20,8 +20,8 @@
 
 #define MAX_ENTRIES   64
 #define MAX_FIELD     64
-#define DATA_DIR      "/Apps/Data/Passwords"
-#define ITEMS_PATH    "/Apps/Data/Passwords/items.txt"
+#define DATA_DIR      "/Data/Passwords"
+#define ITEMS_PATH    "/Data/Passwords/items.txt"
 #define FILE_BUF_SZ   (MAX_ENTRIES * (MAX_FIELD * 4 + 8))
 
 typedef struct {
@@ -721,7 +721,7 @@ static void build_field_view(void)
 HB_APP_ENTRY(payload_entry)
 {
     hb_trace_init();
-    hb_fs_mkdir("/Apps/Data");
+    hb_fs_mkdir("/Data");
     hb_fs_mkdir(DATA_DIR);
     load_items();
 

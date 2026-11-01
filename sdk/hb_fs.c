@@ -24,6 +24,12 @@
  * The object is a plain memory block the OS member functions operate on.
  * The block is sized a little over the firmware object to leave stack slack. */
 #define FOBJ_SIZE        0x60
+/* One-shot reads/writes use a static, generously sized object instead of 0x60 bytes of
+ * stack: on hardware the OS read path wrote past a 0x60 stack object into the
+ * callers' saved registers, causing a crash on return. Not reentrant, like
+ * the shared cache below. */
+#define FOBJ_ONESHOT_SIZE 0x400
+static uint8_t s_oneshot_obj[FOBJ_ONESHOT_SIZE] __attribute__((aligned(8)));
 #define FOBJ_CACHE_BYTES 0x1010
 
 typedef void (*fobj_open_fn) (void *o, const char *path, int a2, int a3,
@@ -46,15 +52,25 @@ typedef bool (*fs_exists_fn) (const char *path, int volume);
 #define FS_EXISTS  ((fs_exists_fn) (0x0841bb7cu | 1u))
 
 /* Shared scratch cache. Stack-allocating it inside an app call chain can
-   overflow the task stack, and the app linker folds .bss into the loaded
-   image (so a static cache would overwrite app/stub code when cleared), so
-   it lives at a fixed scratch address. Not reentrant — fine for our use. */
-#define FOBJ_CACHE_ADDR 0x09118000u
+   overflow the task stack, so it is static — in this image's .bss, which lives
+   in the image's own heap block (relocatable apps and the heap-loaded
+   resident). It used to sit at fixed 0x09118000, which is live OS heap. Not
+   reentrant — fine for our use. */
+#ifdef HB_FS_FIXED_CACHE
+/* The flashed firmware bootstrap only: its .bss window is 0x100 bytes, and its
+   source must keep matching the image in firmware. */
+static uint8_t *fs_scratch_cache(void)
+{
+    return (uint8_t *)HB_FS_FIXED_CACHE;
+}
+#else
+static uint8_t s_fs_cache[FOBJ_CACHE_BYTES] __attribute__((aligned(32)));
 
 static uint8_t *fs_scratch_cache(void)
 {
-    return (uint8_t *)FOBJ_CACHE_ADDR;
+    return s_fs_cache;
 }
+#endif
 
 static void fs_zero_cache(uint8_t *cache)
 {
@@ -63,7 +79,7 @@ static void fs_zero_cache(uint8_t *cache)
 }
 
 /* A live handle around one OS file object. `obj` may point at a stack buffer
-   (one-shot ops) or a fixed scratch address (the persistent stream). */
+   (one-shot ops) or a static object (the persistent stream). */
 typedef struct {
     void    *obj;
     uint32_t put;     /* bytes appended so far — used to set EOF on finish */
@@ -73,12 +89,12 @@ typedef struct {
    On failure the object is closed and false is returned, so the caller never
    has to clean up after a failed open. */
 static bool fobj_begin(fobj_t *f, void *obj, uint8_t *cache,
-                       const char *path, bool write)
+                       const char *path, bool write, int volume)
 {
     f->obj = obj;
     f->put = 0;
     fs_zero_cache(cache);
-    FOBJ_OPEN(obj, path, write ? 0 : 1, FS_MAIN_VOLUME, 0x1000, 1, cache);
+    FOBJ_OPEN(obj, path, write ? 0 : 1, volume, 0x1000, 1, cache);
     if (FOBJ_READY(obj)) return true;
     FOBJ_CLOSE(obj);
     return false;
@@ -92,8 +108,8 @@ static bool fobj_append(fobj_t *f, const void *data, uint32_t len)
     const uint8_t *p = (const uint8_t *)data;
     while (len) {
         uint32_t chunk = len > FS_WRITE_CHUNK ? FS_WRITE_CHUNK : len;
-        uint32_t put = 0;
-        if (FOBJ_WRITE(f->obj, chunk, p, &put) != 0 || put != chunk) return false;
+        uint64_t put = 0;   /* 64-bit slot: see hb_fs_size (low word holds the count) */
+        if (FOBJ_WRITE(f->obj, chunk, p, (uint32_t *)&put) != 0 || (uint32_t)put != chunk) return false;
         p += chunk; len -= chunk; f->put += chunk;
     }
     return true;
@@ -114,9 +130,9 @@ bool hb_fs_exists(const char *path)
 
 bool hb_fs_write(const char *path, const void *data, uint32_t size)
 {
-    uint8_t obj[FOBJ_SIZE];
+    uint8_t *obj = s_oneshot_obj;
     fobj_t f;
-    if (!fobj_begin(&f, obj, fs_scratch_cache(), path, true)) return false;
+    if (!fobj_begin(&f, obj, fs_scratch_cache(), path, true, FS_MAIN_VOLUME)) return false;
     bool ok = fobj_append(&f, data, size);
     if (ok) fobj_finish(&f); else FOBJ_CLOSE(obj);
     return ok;
@@ -127,9 +143,9 @@ bool hb_fs_write(const char *path, const void *data, uint32_t size)
 bool hb_fs_write_parts(const char *path, void *const *ptrs,
                        const uint32_t *lens, int nparts)
 {
-    uint8_t obj[FOBJ_SIZE];
+    uint8_t *obj = s_oneshot_obj;
     fobj_t f;
-    if (!fobj_begin(&f, obj, fs_scratch_cache(), path, true)) return false;
+    if (!fobj_begin(&f, obj, fs_scratch_cache(), path, true, FS_MAIN_VOLUME)) return false;
     bool ok = true;
     for (int i = 0; i < nparts && ok; i++)
         ok = fobj_append(&f, ptrs[i], lens[i]);
@@ -139,18 +155,17 @@ bool hb_fs_write_parts(const char *path, void *const *ptrs,
 
 /* ---- streaming writer: one file kept open across many appends (e.g. a screen
    recording flushed buffer-by-buffer as it fills, so it isn't RAM-bound). One
-   stream at a time, on a fixed-address object + cache (a stack/.bss buffer
-   can't survive between the open and the appends). ---- */
-#define STREAM_OBJ_ADDR   0x0911a000u
-#define STREAM_CACHE_ADDR 0x0911a200u
+   stream at a time, on a static object + cache (a stack buffer can't survive
+   between the open and the appends). ---- */
+static uint8_t s_stream_obj[FOBJ_ONESHOT_SIZE] __attribute__((aligned(8)));
+static uint8_t s_stream_cache[FOBJ_CACHE_BYTES] __attribute__((aligned(32)));
 static fobj_t s_stream;
 static bool   s_stream_live;
 
 bool hb_fs_stream_open(const char *path)
 {
     if (s_stream_live) hb_fs_stream_close();
-    if (!fobj_begin(&s_stream, (void *)STREAM_OBJ_ADDR,
-                    (uint8_t *)STREAM_CACHE_ADDR, path, true))
+    if (!fobj_begin(&s_stream, s_stream_obj, s_stream_cache, path, true, FS_MAIN_VOLUME))
         return false;
     s_stream_live = true;
     return true;
@@ -174,11 +189,18 @@ bool hb_fs_stream_close(void)
    bytes actually read (0 if the file is missing or the read failed). */
 uint32_t hb_fs_read(const char *path, void *buf, uint32_t max_size)
 {
-    uint8_t obj[FOBJ_SIZE];
+    return hb_fs_read_at(path, buf, max_size, FS_MAIN_VOLUME);
+}
+
+uint32_t hb_fs_read_at(const char *path, void *buf, uint32_t max_size, int volume)
+{
+    uint8_t *obj = s_oneshot_obj;
     fobj_t f;
-    if (!fobj_begin(&f, obj, fs_scratch_cache(), path, false)) return 0;
-    uint32_t got = 0;
-    if (FOBJ_READ(obj, max_size, buf, &got) != 0) got = 0;
+    if (!fobj_begin(&f, obj, fs_scratch_cache(), path, false, volume)) return 0;
+    uint64_t got64 = 0;   /* 64-bit slot: see hb_fs_size (low word holds the count) */
+    uint32_t got;
+    if (FOBJ_READ(obj, max_size, buf, (uint32_t *)&got64) != 0) got64 = 0;
+    got = (uint32_t)got64;
     FOBJ_CLOSE(obj);
     return got;
 }
@@ -249,7 +271,7 @@ void hb_fs_dir_close(hb_dir_t *iter)
 /* ----- modify / stat ----- */
 typedef int (*fs_remove_t) (const char *path, int volume);
 typedef int (*fs_mkdir_t)  (const char *path, int volume);
-typedef int (*fs_getsize_t)(const char *path, uint32_t *size_out, int volume);
+typedef int (*fs_getsize_t)(const char *path, uint64_t *size_out, int volume);   /* 64-bit size */
 typedef int (*fs_getattr_t)(const char *path, uint8_t *attr_out, int volume);
 typedef int (*fs_rmdir_t)  (const char *path, int a2, int volume, int a4);
 typedef int (*fs_setattr_t)(const char *path, uint8_t attr, int volume);
@@ -276,10 +298,17 @@ bool hb_fs_mkdir(const char *path)
 
 uint32_t hb_fs_size(const char *path)
 {
-    uint32_t sz = 0;
-    int rc = FS_GETSIZE(path, &sz, FS_MAIN_VOLUME);
+    return hb_fs_size_at(path, FS_MAIN_VOLUME);
+}
+
+uint32_t hb_fs_size_at(const char *path, int volume)
+{
+    /* The OS stores a 64-bit size: with a 32-bit local its high word overwrote the
+     * next stack slot (the caller's saved r4 at -Os), causing a later crash. */
+    uint64_t sz = 0;
+    int rc = FS_GETSIZE(path, &sz, volume);
     if (rc != 0) return 0;
-    return sz;
+    return (uint32_t)sz;
 }
 
 bool hb_fs_is_dir(const char *path)

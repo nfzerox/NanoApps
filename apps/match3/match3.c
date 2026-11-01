@@ -25,8 +25,9 @@
 #define N_COLORS     6
 #define HEADER_H     40
 
-#define CANVAS_BUF_ADDR  0x092E0000u
-static uint8_t * const s_canvas_buf = (uint8_t *)CANVAS_BUF_ADDR;
+/* In the app's own arena: the old fixed 0x092E0000 lies inside the OS heap
+ * and was overwriting live objects (and sometimes this app's own code). */
+static uint8_t s_canvas_buf[BOARD_W * BOARD_H * 4] __attribute__((aligned(4)));
 
 static const uint32_t s_gem_color[N_COLORS] = {
     0xe63946, 0xfcbf49, 0x2a9d8f, 0x457b9d, 0xa663cc, 0xff6bd6,
@@ -47,8 +48,8 @@ static int    s_best  = 0;
 static lv_obj_t *s_canvas;
 static lv_obj_t *s_score_lbl;
 
-#define BEST_PATH  "/Apps/Data/Match3/best.txt"
-#define DATA_DIR   "/Apps/Data/Match3"
+#define BEST_PATH  "/Data/Match3/best.txt"
+#define DATA_DIR   "/Data/Match3"
 
 static uint32_t s_rng;
 static uint32_t rnd(void) { s_rng ^= s_rng << 13; s_rng ^= s_rng >> 17; s_rng ^= s_rng << 5; return s_rng; }
@@ -306,7 +307,7 @@ static void on_new(lv_event_t *e)
 HB_APP_ENTRY(payload_entry)
 {
     hb_trace_init();
-    hb_fs_mkdir("/Apps/Data");
+    hb_fs_mkdir("/Data");
     hb_fs_mkdir(DATA_DIR);
     load_best();
     s_rng = hb_time_uptime_us() | 1u;

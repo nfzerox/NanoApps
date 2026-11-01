@@ -1,7 +1,7 @@
 /*
  * crosswords — solve a custom crossword puzzle.
  *
- * Puzzle file format (drop at /Apps/Data/Crosswords/<name>.txt):
+ * Puzzle file format (drop at /Data/Crosswords/<name>.txt):
  *
  *   TITLE: Sample
  *   SIZE: 9          # square grid up to 13
@@ -21,7 +21,7 @@
  *   ...
  *
  * One built-in puzzle is shipped so the app always works. Picker
- * shows built-in + every *.txt in /Apps/Data/Crosswords.
+ * shows built-in + every *.txt in /Data/Crosswords.
  *
  * Grid is canvas-rendered (one widget) to stay inside the LVGL
  * heap. Input keypad is a 7-column button matrix (A-Z + del).
@@ -33,10 +33,9 @@
 #define MAX_SIZE       13
 #define MAX_CLUES      40
 #define MAX_PUZZLES    16
-#define DATA_DIR       "/Apps/Data/Crosswords"
+#define DATA_DIR       "/Data/Crosswords"
 #define PLAY_W         240
 #define PLAY_H         240
-#define CANVAS_ADDR    0x092E0000u
 
 typedef struct {
     int  row, col;       /* 1-based start */
@@ -58,7 +57,9 @@ static puzzle_t s_puzzle;
 static char s_state[MAX_SIZE][MAX_SIZE + 1];      /* user entries */
 static int  s_cur_r, s_cur_c;
 static int  s_dir = 0;          /* 0=across, 1=down */
-static uint8_t * const s_canvas_buf = (uint8_t *)CANVAS_ADDR;
+/* In the app's own arena: the old fixed 0x092E0000 lies inside the OS heap
+ * and was overwriting live objects (and sometimes this app's own code). */
+static uint8_t s_canvas_buf[PLAY_W * PLAY_H * 4] __attribute__((aligned(4)));
 
 static lv_obj_t *s_canvas;
 static lv_obj_t *s_clue_lbl;

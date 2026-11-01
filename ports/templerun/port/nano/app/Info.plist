@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>org.nanoapps.templerun</string>
+<key>CFBundleName</key><string>Temple Run</string>
+<key>CFBundleExecutable</key><string>templerun</string>
+<key>HBAppKind</key><integer>2</integer>
+<key>HBIconGlyph</key><string>gamepad</string>
+<key>HBIconColor</key><string>#3a5a2a</string>
+</dict></plist>

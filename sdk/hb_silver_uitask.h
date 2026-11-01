@@ -21,6 +21,9 @@
 #define HB_SILVER_HOME_DISPATCH_SLOT 0x190u        /* action-dispatch slot offset  */
 #define HB_SILVER_HOME_DISPATCH_ORIG 0x082ae8ddu   /* stock dispatcher (forward to)*/
 
+#define HB_SILVER_HOME_MESSAGE_SLOT  0x40u          /* complete message handler     */
+#define HB_SILVER_HOME_MESSAGE_ORIG  0x085b49adu
+
 #define HB_SILVER_HOME_EVENT_SLOT    0x17cu         /* queued named-event slot      */
 #define HB_SILVER_HOME_EVENT_ORIG    0x081c4675u    /* stock handler (thumb)        */
 
@@ -29,6 +32,13 @@
  * on custom home items whose SBID has no built-in action binding. */
 #define HB_SILVER_HOME_RAWMSG_SLOT   0x188u         /* raw-input handler slot    */
 #define HB_SILVER_HOME_RAWMSG_ORIG   0x081c4505u    /* stock handler (thumb)        */
+
+/* 1.1.2 sends this model notification when rebuilding Home after USB eject.
+ * TParamsMessage: type 30 at +4, payload at +8, notification code at payload+4.
+ * RAWMSG receives it inside the stock Home message handler (0x085b49ac).
+ * Defer UI changes to a later queued message so native view teardown can finish. HandleGotoMainScreen is not sent on this return path.
+ * Verified by an on-device message trace and no-tap add/remove cycles. */
+#define HB_SILVER_HOME_REFRESH_NOTICE 0x6385u
 
 /*
  * Read the event-name C-string out of a params message (as delivered to the
@@ -52,6 +62,9 @@ const char *hb_silver_translate_msg(void *self, void *raw_msg, char *out_buf, in
 
 int hb_silver_rawmsg(void *self, void *raw_msg, const char *claim_prefix,
                      const char *claim_suffix, char *out_buf, int buf_len);
+/* Optional breadcrumb sink for hb_silver_rawmsg (NULL = off). The resident
+ * points it at hb_trace_log to record sbitem event names and dispatch path. */
+extern void (*hb_silver_rawmsg_trace)(const char *tag, uint32_t v1, uint32_t v2);
 
 /*
  * Patch class_vtable[slot_off] to `handler` (thumb bit set automatically),
@@ -75,11 +88,20 @@ uint32_t hb_silver_uitask_hook(uint32_t class_vtable, uint32_t slot_off, void *h
 void *hb_silver_patch_function(uint32_t func, void *hook, void *tramp);
 /* Variant copying `n` prologue bytes (must land on an instruction boundary). */
 void *hb_silver_patch_function_n(uint32_t func, void *hook, void *tramp, int n);
+
+/* Deterministic variants for reboot-persistent patches. `stock` contains the
+ * known original prologue bytes for this firmware. They rebuild the trampoline
+ * from those bytes even if `func` is already patched, then aim the entry at the
+ * current hook. This avoids trusting scratch RAM left by a warm reboot. */
+void *hb_silver_patch_function_stock(uint32_t func, void *hook, void *tramp,
+                                     const void *stock, int n);
 /* Like _n but uses a 4-byte B.W entry jump (stays in Thumb, ±16 MB), so n can be
  * as small as 4 — for functions with a PC-relative op inside the first 10 bytes
  * that can't fit the 10-byte jump. The relocated n bytes must NOT be PC-relative;
  * the rest (from func+n) stays put (and may be PC-relative). */
 void *hb_silver_patch_function_bw(uint32_t func, void *hook, void *tramp, int n);
+void *hb_silver_patch_function_bw_stock(uint32_t func, void *hook, void *tramp,
+                                        const void *stock, int n);
 
 /*
  * Re-aim an already-patched function's entry at a new `hook` (e.g. on a re-push
@@ -91,5 +113,12 @@ void hb_silver_repoint_function(uint32_t func, void *hook);
 /* Re-aim a function patched with hb_silver_patch_function_bw (rewrites only the
  * 4-byte B.W entry). Use this — NOT hb_silver_repoint_function — for B.W patches. */
 void hb_silver_repoint_function_bw(uint32_t func, void *hook);
+
+/* Register-preserving absolute Thumb jump: ldr.w pc,[pc]; .word target|1.
+ * No branch-distance limit. Entry and trampoline must be 4-byte aligned;
+ * n >= 8 must be a multiple of 4, with position-independent instructions. */
+void *hb_silver_patch_function_abs_stock(uint32_t func, void *hook, void *tramp,
+                                        const void *stock, int n);
+void hb_silver_repoint_function_abs(uint32_t func, void *hook);
 
 #endif /* HB_SILVER_UITASK_H */

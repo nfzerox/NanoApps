@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>org.nanoapps.flappybird</string>
+<key>CFBundleName</key><string>Flappy Bird</string>
+<key>CFBundleExecutable</key><string>flappybird</string>
+<key>HBAppKind</key><integer>2</integer>
+<key>HBIconGlyph</key><string>gamepad</string>
+<key>HBIconColor</key><string>#4ec0ca</string>
+</dict></plist>

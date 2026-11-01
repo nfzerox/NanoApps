@@ -34,8 +34,8 @@
 #define TILT_RESET_MG    350       /* |z| below this = near-upright, re-arm */
 #define TILT_COOLDOWN_MS 900u
 
-#define DATA_DIR     "/Apps/Data/HeadsUp"
-#define DECKS_DIR    "/Apps/Data/HeadsUp/decks"
+#define DATA_DIR     "/Data/HeadsUp"
+#define DECKS_DIR    "/Data/HeadsUp/decks"
 #define MAX_DECKS    24
 #define MAX_DECK_WORDS 256
 
@@ -150,7 +150,7 @@ static void load_all_decks(void)
     for (int i = 0; i < N_BUILTIN && s_n_all_decks < MAX_DECKS; i++) {
         s_all_decks[s_n_all_decks++] = s_builtin_decks[i];
     }
-    /* Then custom decks from /Apps/Data/HeadsUp/decks/*.txt. */
+    /* Then custom decks from /Data/HeadsUp/decks/*.txt. */
     hb_dir_t d;
     if (!hb_fs_dir_open(&d, DECKS_DIR, false)) return;
     char fn[64]; bool is_dir = false;
@@ -427,7 +427,7 @@ static void build_picker(lv_obj_t *scr)
 
     /* Deck buttons inside a scrollable container so the picker still
        fits even when the user has dropped a bunch of custom decks
-       in /Apps/Data/HeadsUp/decks/. */
+       in /Data/HeadsUp/decks/. */
     lv_obj_t *box = lv_obj_create(s_picker_view);
     lv_obj_set_size(box, 240, 432 - 160);
     lv_obj_align(box, LV_ALIGN_TOP_MID, 0, 160);
@@ -525,7 +525,7 @@ HB_APP_ENTRY(payload_entry)
     s_rng = hb_time_uptime_us() | 1u;
 
     /* Built-in decks first, then any custom decks from disk. */
-    hb_fs_mkdir("/Apps/Data");
+    hb_fs_mkdir("/Data");
     hb_fs_mkdir(DATA_DIR);
     hb_fs_mkdir(DECKS_DIR);
     load_all_decks();

@@ -1,18 +1,17 @@
 /*
  * hb_touch_mb.h — resident-latched event-path touch mailbox (single source of truth).
  *
- * The resident's touch-posting entry hook writes [magic, x, y, pressed] to a fixed RAM
- * mailbox on every touch event; surface apps read it so a tap is never missed
- * (polling the transient OS touch list only caught ~1/4 of taps). The address +
- * layout are defined ONCE here and shared by the writer (resident) and every
- * reader (LVGL/GL surface apps), instead of being copied per app.
+ * The resident's touch-posting entry hook writes [magic, x, y, pressed] to the
+ * mailbox in its shared block (hb_shared->touch, hb_shared.h) on every touch
+ * event; surface apps read it so a tap is never missed (polling the transient
+ * OS touch list only caught ~1/4 of taps). It used to sit at fixed 0x09135f40,
+ * which is live OS heap.
  */
 #ifndef HB_TOUCH_MB_H
 #define HB_TOUCH_MB_H
 
 #include <stdint.h>
 
-#define HB_TOUCH_MB_ADDR   0x09135f40u   /* [magic][x][y][pressed], 4x int32   */
 #define HB_TOUCH_MB_MAGIC  0x54504e54u   /* 'TNPT' — resident has written it    */
 
 typedef struct {

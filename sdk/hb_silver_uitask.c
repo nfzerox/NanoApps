@@ -62,14 +62,16 @@ static void hb__emit_bw(uint8_t *dst, uint32_t target)
  * as small as 4 — one Thumb-2 op). Valid only when |hook-func| and |func-tramp|
  * are within B.W's ±16 MB and the relocated `n` prologue bytes are not PC-relative
  * (the rest of the original, from func+n, stays in place and may be PC-relative). */
-void *hb_silver_patch_function_bw(uint32_t func, void *hook, void *tramp, int n)
+void *hb_silver_patch_function_bw_stock(uint32_t func, void *hook, void *tramp,
+                                        const void *stock, int n)
 {
     uint8_t *f = (uint8_t *)(uintptr_t)func;
     uint8_t *t = (uint8_t *)tramp;
+    const uint8_t *s = (const uint8_t *)stock;
     int i;
 
-    for (i = 0; i < n; i++)                          /* save overwritten prologue   */
-        t[i] = f[i];
+    for (i = 0; i < n; i++)
+        t[i] = s[i];
     hb__emit_bw(t + n, func + (uint32_t)n);          /* trampoline -> func+n (rest)  */
     hb__emit_bw(f, (uint32_t)(uintptr_t)hook);       /* func entry -> our hook       */
     hb_icache_invalidate((uint32_t)(uintptr_t)tramp, (uint32_t)n + 6u);
@@ -77,22 +79,36 @@ void *hb_silver_patch_function_bw(uint32_t func, void *hook, void *tramp, int n)
     return (void *)((uintptr_t)tramp | 1u);          /* callable "original"          */
 }
 
+void *hb_silver_patch_function_bw(uint32_t func, void *hook, void *tramp, int n)
+{
+    return hb_silver_patch_function_bw_stock(func, hook, tramp,
+                                              (const void *)(uintptr_t)func, n);
+}
+
 /* Same as hb_silver_patch_function but copies `n` prologue bytes (the entry jump
  * is 10 bytes, so the prologue must be >= 10 and `n` must land on an instruction
  * boundary — a 4-byte Thumb-2 op spanning byte 10 needs n=12, etc.). */
-void *hb_silver_patch_function_n(uint32_t func, void *hook, void *tramp, int n)
+void *hb_silver_patch_function_stock(uint32_t func, void *hook, void *tramp,
+                                     const void *stock, int n)
 {
     uint8_t *f = (uint8_t *)(uintptr_t)func;
     uint8_t *t = (uint8_t *)tramp;
+    const uint8_t *s = (const uint8_t *)stock;
     int i;
 
-    for (i = 0; i < n; i++)                          /* save overwritten prologue */
-        t[i] = f[i];
+    for (i = 0; i < n; i++)
+        t[i] = s[i];
     hb__emit_jump(t + n, (func + (uint32_t)n) | 1u); /* trampoline -> func+n (rest of original) */
     hb__emit_jump(f, ((uint32_t)(uintptr_t)hook) | 1u);  /* func entry -> our hook */
     hb_icache_invalidate((uint32_t)(uintptr_t)tramp, (uint32_t)n + 14u);
     hb_icache_invalidate(func, 16u);
     return (void *)((uintptr_t)tramp | 1u);          /* callable "original" */
+}
+
+void *hb_silver_patch_function_n(uint32_t func, void *hook, void *tramp, int n)
+{
+    return hb_silver_patch_function_stock(func, hook, tramp,
+                                           (const void *)(uintptr_t)func, n);
 }
 
 void *hb_silver_patch_function(uint32_t func, void *hook, void *tramp)
@@ -117,6 +133,34 @@ void hb_silver_repoint_function_bw(uint32_t func, void *hook)
      * would clobber the bytes the trampoline jumps back to. */
     hb__emit_bw((uint8_t *)(uintptr_t)func, (uint32_t)(uintptr_t)hook);
     hb_icache_invalidate(func, 8u);
+}
+
+static void hb__emit_abs(uint32_t address, void *target)
+{
+    uint32_t *p = (uint32_t *)(uintptr_t)address;
+    p[0] = 0xf000f8dfu; /* ldr.w pc,[pc,#0], literal at address+4 */
+    p[1] = (uint32_t)(uintptr_t)target | 1u;
+}
+
+void hb_silver_repoint_function_abs(uint32_t func, void *hook)
+{
+    if (func & 3u) return;
+    hb__emit_abs(func, hook);
+    hb_icache_invalidate(func, 8u);
+}
+
+void *hb_silver_patch_function_abs_stock(uint32_t func, void *hook, void *tramp,
+                                        const void *stock, int n)
+{
+    if (n < 8 || ((func | (uint32_t)(uintptr_t)tramp | (uint32_t)n) & 3u))
+        return 0;
+    const uint8_t *s = (const uint8_t *)stock;
+    uint8_t *t = (uint8_t *)tramp;
+    for (int i = 0; i < n; i++) t[i] = s[i];
+    hb__emit_abs((uint32_t)(uintptr_t)(t + n), (void *)(uintptr_t)(func + n));
+    hb_icache_invalidate((uint32_t)(uintptr_t)t, (uint32_t)n + 8u);
+    hb_silver_repoint_function_abs(func, hook);
+    return (void *)((uintptr_t)tramp | 1u);
 }
 
 /*
@@ -222,6 +266,14 @@ static int hb__suffix(const char *s, const char *suf)
     return 1;
 }
 
+/* Breadcrumbs are compiled only into the resident (HB_RAWMSG_TRACE). The
+ * untether bootstrap links this file too, but it lives inside the firmware
+ * image and its BSS is not cleared across a warm reboot, so it must not gain
+ * a function-pointer global. */
+#ifdef HB_RAWMSG_TRACE
+void (*hb_silver_rawmsg_trace)(const char *tag, uint32_t v1, uint32_t v2);
+#endif
+
 int hb_silver_rawmsg(void *self, void *raw_msg, const char *claim_prefix,
                      const char *claim_suffix, char *out_buf, int buf_len)
 {
@@ -250,6 +302,14 @@ int hb_silver_rawmsg(void *self, void *raw_msg, const char *claim_prefix,
     if (out_buf[0] && claim_prefix && hb__prefix(out_buf, claim_prefix)
                    && (!claim_suffix || hb__suffix(out_buf, claim_suffix)))
         claimed = 1;
+
+    /* Record sbitem event names in 8-char chunks (tag = text, v1 = offset). */
+#ifdef HB_RAWMSG_TRACE
+    if (hb_silver_rawmsg_trace && hb__prefix(out_buf, "sbitem.")) {
+        for (int k = 0; k < 32 && out_buf[k]; k += 8)   /* icon taps only */
+            hb_silver_rawmsg_trace(out_buf + k, (uint32_t)k, (uint32_t)claimed);
+    }
+#endif
 
     if (!claimed) {
         if (out_buf[0])                     /* decoded but not ours: dispatch once */

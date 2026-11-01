@@ -11,7 +11,7 @@
  *               keyboard for editing.
  *   FIELD    -- T9 keyboard fills a single field.
  *
- * Storage at /Apps/Data/Contacts/items.txt:
+ * Storage at /Data/Contacts/items.txt:
  *   name<TAB>phone<TAB>email<TAB>address<TAB>notes<NL>
  * Multi-line address/notes use literal '|' as a soft newline so the
  * record stays on one disk line.
@@ -24,8 +24,8 @@
 
 #define MAX_CONTACTS 64
 #define MAX_FIELD    96
-#define DATA_DIR     "/Apps/Data/Contacts"
-#define ITEMS_PATH   "/Apps/Data/Contacts/items.txt"
+#define DATA_DIR     "/Data/Contacts"
+#define ITEMS_PATH   "/Data/Contacts/items.txt"
 #define FILE_BUF_SZ  (MAX_CONTACTS * (MAX_FIELD * 5 + 16))
 
 typedef struct {
@@ -150,7 +150,7 @@ static void save_all(void)
             buf[p++] = (f == 4) ? '\n' : '\t';
         }
     }
-    hb_fs_mkdir("/Apps/Data"); hb_fs_mkdir(DATA_DIR);
+    hb_fs_mkdir("/Data"); hb_fs_mkdir(DATA_DIR);
     hb_fs_write(ITEMS_PATH, buf, p);
 }
 
@@ -290,15 +290,19 @@ static void build_library(void)
     s_search_ta = lv_textarea_create(s_lib_view);
     lv_textarea_set_one_line(s_search_ta, true);
     lv_textarea_set_placeholder_text(s_search_ta, "Search...");
-    lv_obj_set_size(s_search_ta, 232, 36);
+    lv_obj_set_size(s_search_ta, 228, 36);
     lv_obj_align(s_search_ta, LV_ALIGN_TOP_MID, 0, 34);
-    /* Stop the field jittering on its own: the blinking cursor was driving an
-       internal scroll-to-view loop on the one-line field. Kill the scrollbar,
-       disable scrolling outright, and stop the cursor blink animation. */
+    /* The theme's vertical padding left less than one font line inside this
+     * 36px field. Textarea's cursor positioning scrolls programmatically even
+     * when SCROLLABLE is cleared, repeatedly chasing the clipped line. Fit the
+     * line instead; retain normal cursor blinking and horizontal text movement. */
+    lv_obj_set_style_pad_ver(s_search_ta, 4, 0);
     lv_obj_set_scrollbar_mode(s_search_ta, LV_SCROLLBAR_MODE_OFF);
-    lv_obj_clear_flag(s_search_ta, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_scroll_dir(s_search_ta, LV_DIR_NONE);
-    lv_obj_set_style_anim_duration(s_search_ta, 0, LV_PART_CURSOR);
+    lv_obj_clear_flag(s_search_ta, LV_OBJ_FLAG_SCROLL_ON_FOCUS);
+    lv_obj_set_scroll_dir(s_search_ta, LV_DIR_HOR);
+    /* Cancel a scroll queued during sizing, before the padding was corrected. */
+    lv_obj_update_layout(s_search_ta);
+    lv_obj_scroll_to_y(s_search_ta, 0, LV_ANIM_OFF);
     lv_obj_add_event_cb(s_search_ta, on_search_changed, LV_EVENT_VALUE_CHANGED, NULL);
     lv_obj_add_event_cb(s_search_ta, on_search_clicked, LV_EVENT_CLICKED, NULL);
 
@@ -522,7 +526,7 @@ HB_APP_ENTRY(payload_entry)
 {
     hb_trace_init();
 
-    hb_fs_mkdir("/Apps/Data"); hb_fs_mkdir(DATA_DIR);
+    hb_fs_mkdir("/Data"); hb_fs_mkdir(DATA_DIR);
     load_all();
 
     build_library();

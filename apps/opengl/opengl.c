@@ -8,7 +8,7 @@
  * once). A bottom bar has prev/next buttons + a page indicator; dragging in the
  * content area drives each screen (spin a cube faster, move a light, change a blend
  * mode, slide a sub-texture, orbit a scene...). Touch comes from the resident's
- * event-path mailbox at 0x09135f40 ([magic 'TNPT'], x, y, pressed).
+ * event-path mailbox in its shared block ([magic 'TNPT'], x, y, pressed).
  *
  * Pure fixed-function GLES 1.1: matrices (glFrustumf/glOrthof/glRotatef/...), vertex/
  * color/normal/texcoord arrays, VBOs (+glBufferSubData), glDrawArrays + glDrawElements,

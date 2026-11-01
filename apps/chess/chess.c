@@ -23,8 +23,9 @@
 #define BOARD_W  (8 * CELL_PX)     /* 208 */
 #define BOARD_H  BOARD_W
 #define HEADER_H 36
-#define CANVAS_BUF_ADDR  0x092E0000u
-static uint8_t * const s_canvas_buf = (uint8_t *)CANVAS_BUF_ADDR;
+/* In the app's own arena: the old fixed 0x092E0000 lies inside the OS heap
+ * and was overwriting live objects (and sometimes this app's own code). */
+static uint8_t s_canvas_buf[BOARD_W * BOARD_H * 4] __attribute__((aligned(4)));
 
 /* Piece codes. Positive = white, negative = black. */
 #define EMPTY  0

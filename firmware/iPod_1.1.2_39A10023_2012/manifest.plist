@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>FirmwarePayload</key>
+	<dict>
+		<key>BootloaderName</key>
+		<string>N31.bootloader.rb3</string>
+		<key>BuildVersion</key>
+		<string>39A10023</string>
+		<key>FamilyID</key>
+		<integer>18</integer>
+		<key>FirmwareName</key>
+		<string>Firmware.MSE</string>
+		<key>ProductVersion</key>
+		<string>1.1.2</string>
+		<key>UpdaterFamilyID</key>
+		<integer>37</integer>
+	</dict>
+</dict>
+</plist>

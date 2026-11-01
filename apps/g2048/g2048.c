@@ -20,8 +20,8 @@
 #define GAP_PX    6
 #define BOARD_PX  (N * TILE_PX + (N + 1) * GAP_PX)   /* 4*52 + 5*6 = 238 */
 
-#define BEST_PATH "/Apps/Data/g2048/best.txt"
-#define DATA_DIR  "/Apps/Data/g2048"
+#define BEST_PATH "/Data/g2048/best.txt"
+#define DATA_DIR  "/Data/g2048"
 
 static int s_board[N][N];      /* exponent: 1=>2, 2=>4, ... 0=>empty */
 static int s_score;
@@ -329,7 +329,7 @@ static void on_board_release(lv_event_t *e)
 HB_APP_ENTRY(payload_entry)
 {
     hb_trace_init();
-    hb_fs_mkdir("/Apps/Data");
+    hb_fs_mkdir("/Data");
     hb_fs_mkdir(DATA_DIR);
     load_best();
 

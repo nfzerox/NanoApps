@@ -3,11 +3,12 @@
  *
  * Statically linked into each LVGL app at 0x09280000 (LVGL_ENABLE=1, fixed pool,
  * .bss below the 0x09200000 compositor heap). Self-contained: reads the hardware microsecond tick register and the OS touch list directly — no callouts. The resident
- * loads the app binary to 0x09280000 and calls payload_entry(0, fb, w, h).
+ * loads the app into its own heap arena and calls payload_entry(0, fb, w, h, shared).
  */
 #include "lvgl/lvgl.h"
 #include "hb_lv_surface.h"
 #include "hb_surface_input.h"
+#include "hb_shared.h"
 #ifdef HB_LV_COMPOSITOR
 #include "hb_compositor.h"
 #endif
@@ -192,7 +193,7 @@ static void lv_surface_setup(void *fb, int w, int h)
     lv_refr_now(s_disp);
 }
 
-/* Entry point. The resident calls entry(0, fb, w, h) on EVERY launch; we set up
+/* Entry point. The resident calls entry(0, fb, w, h, shared) on EVERY launch; we set up
  * LVGL + the app fresh and return the per-frame fn.
  *
  * Zero our .bss every launch — this resets lv_global (timers, objects) AND the
@@ -206,12 +207,12 @@ static void lv_surface_setup(void *fb, int w, int h)
  * Fixed-VA build only: ALSO flush the I-cache over our text — the .bin was
  * raw-loaded to 0x09280000. (Reloc: hb_reloc_load already flushed the arena.) */
 __attribute__((section(".text.entry"), used, noinline))
-void *payload_entry(int op, void *fb, int w, int h)
+void *payload_entry(int op, void *fb, int w, int h, hb_shared_t *sh)
 {
     extern unsigned int __bss_start__[], __bss_end__[];
     unsigned int *p;
 
-    if (op != 0)
+    if (op != 0 || !sh || sh->magic != HB_SHARED_MAGIC || sh->version != HB_SHARED_VERSION)
         return 0;
 #ifndef HB_LV_RELOC
     {
@@ -223,6 +224,7 @@ void *payload_entry(int op, void *fb, int w, int h)
     }
 #endif
     for (p = __bss_start__; p < __bss_end__; p++) *p = 0;
+    hb_shared = sh;                     /* after the bss clear (it lives there) */
     lv_surface_setup(fb, w, h);
     return (void *)&lv_surface_frame;
 }

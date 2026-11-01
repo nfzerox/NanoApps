@@ -3,7 +3,7 @@
  *
  * v1 ships a tiny built-in dictionary (~60 common entries) so the
  * app is useful out of the box. The user can drop additional
- * dictionaries at /Apps/Data/Dictionary/*.txt — same format as the
+ * dictionaries at /Data/Dictionary/*.txt — same format as the
  * embedded blob (one entry per line: "word\tdefinition") and the
  * lookups merge across all loaded sources.
  *
@@ -23,7 +23,7 @@
 #define MAX_ENTRIES   2000
 #define MAX_WORD_LEN  48
 #define MAX_DEF_LEN   256
-#define DATA_DIR      "/Apps/Data/Dictionary"
+#define DATA_DIR      "/Data/Dictionary"
 
 typedef struct {
     const char *word;
@@ -301,7 +301,7 @@ static void on_back(lv_event_t *e)
 HB_APP_ENTRY(payload_entry)
 {
     hb_trace_init();
-    hb_fs_mkdir("/Apps/Data");
+    hb_fs_mkdir("/Data");
     hb_fs_mkdir(DATA_DIR);
     load_all();
 

@@ -69,11 +69,14 @@ long hb_silver_icon_register_bitmaps(const uint32_t *bmh_addrs, const uint32_t *
 long hb_silver_icon_register_lazy(int count, void *(*alloc)(uint32_t));
 
 /*
- * Record the CFBundleName for the k-th lazily-served icon (0..count-1), so the
- * resolver serves /Apps/Icons/<name>.bin. Call after register_lazy, per app, on
- * the UI task. Blank/unset names fall back to /Apps/Icons/<k>.bin.
+ * Record the actual folder for the k-th lazily-served icon (0..count-1).
+ * Bundled icons use /Apps/<folder>/icon.bin; legacy icons use Icons/<name>.bin.
+ * Set name, hash and layout on the UI task before publishing the Home item.
  */
 void hb_silver_icon_set_name(int k, const char *name);
+void hb_silver_icon_set_hash(int k, uint32_t hash, int bundled);
+/* Reuse the once-per-boot 64-slot extension; discard cached disk identities. */
+long hb_silver_icon_refresh(void);
 
 /*
  * True iff our extended bitmap-cache entries are still present (no-reboot

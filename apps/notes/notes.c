@@ -10,7 +10,7 @@
  * filling the upper half, and LVGL's QWERTY keyboard below. There is
  * NO save button — typing autosaves on every keystroke and on exit.
  *
- * Storage: each note is /Apps/Data/Notes/note<id>.txt, where <id> is
+ * Storage: each note is /Data/Notes/note<id>.txt, where <id> is
  * a monotonically-increasing sequence number. IDs are reused only if
  * the user deletes the highest-id note; otherwise we always pick
  * max_id + 1 so the URL of a note doesn't change once created.
@@ -28,7 +28,7 @@
 #define MAX_NOTES   256
 #define MAX_NOTE_SZ 4096
 #define PREVIEW_LEN 28
-#define DATA_DIR    "/Apps/Data/Notes"
+#define DATA_DIR    "/Data/Notes"
 #define MAX_FOLDERS 32
 #define FOLDER_LEN  32
 
@@ -87,7 +87,7 @@ static void folder_path(char *out)
 
 static void path_for(int id, char *out)
 {
-    /* "/Apps/Data/Notes/[<folder>/]noteN.txt" */
+    /* "/Data/Notes/[<folder>/]noteN.txt" */
     int i = 0;
     folder_path(out); while (out[i]) i++;
     out[i++] = '/';
@@ -518,7 +518,7 @@ HB_APP_ENTRY(payload_entry)
 {
     hb_trace_init();
 
-    hb_fs_mkdir("/Apps/Data");
+    hb_fs_mkdir("/Data");
     hb_fs_mkdir(DATA_DIR);
     scan_notes();
 

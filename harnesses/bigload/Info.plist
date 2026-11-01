@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>	<string>org.nanoapps.bigload</string>
+	<key>CFBundleName</key>		<string>BigLoad</string>
+	<key>CFBundleExecutable</key>	<string>bigload</string>
+	<key>HBAppKind</key>			<integer>1</integer>
+	<key>HBIconGlyph</key>		<string>weight-hanging</string>
+	<key>HBIconColor</key>		<string>#c46a3a</string>
+</dict>
+</plist>

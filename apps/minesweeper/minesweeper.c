@@ -24,9 +24,10 @@
 #define N_MINES      24
 #define HEADER_H     48
 
-#define CANVAS_BUF_ADDR  0x092E0000u
 #define CANVAS_BYTES     (BOARD_PX_W * BOARD_PX_H * 4)
-static uint8_t * const s_canvas_buf = (uint8_t *)CANVAS_BUF_ADDR;
+/* In the app's own arena: the old fixed 0x092E0000 lies inside the OS heap
+ * and was overwriting live objects (and sometimes this app's own code). */
+static uint8_t s_canvas_buf[BOARD_PX_W * BOARD_PX_H * 4] __attribute__((aligned(4)));
 
 /* Each cell: low 4 bits = adjacent mine count (or 0xF for mine);
    higher bits = flags (revealed, flagged). */

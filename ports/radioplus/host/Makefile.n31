@@ -1,0 +1,242 @@
+# Radio+ for the N31 Linux port.
+#
+# Control goes through the bcm2078-bt driver sysfs interface and audio through
+# alsa-lib. Nothing here opens a UART or builds an HCI packet - that is the
+# driver's job.
+#
+# alsa-lib and not tinyalsa, which this linked until the audio path was
+# finished. Everything the app needs from the sound system on this device is an
+# alsa-lib plugin defined in /etc/asound.conf: the softvol that gives the tuner
+# and the Bluetooth leg a volume neither has a register for, the rate converter
+# in front of the codec, and the tee that reaches the headphones and Bluetooth
+# at once. tinyalsa talks to /dev/snd directly and cannot see a plugin at all,
+# so with it there is no volume, no mute, no conversion and no simultaneous
+# output. It is smaller and it was the right choice while none of that existed.
+#
+#   cd host && make -f Makefile.n31            build the app
+#   cd host && make -f Makefile.n31 objs       compile-check only
+#   cd host && make -f Makefile.n31 push       send it to the device
+#   cd host && make -f Makefile.n31 run        push and run it
+#
+# LVGL used to be shared with the Entrain ARM build, on the grounds that the two
+# apps had the same lv_conf. They no longer do: the landscape readout needs
+# ARGB8888 in the software renderer, which no other app in the repo wants. This
+# builds its own, which also means the app builds from a clone of itself rather
+# than requiring a sibling app to have been built first.
+#
+# libasound.a is built once in the ipod repo, by build-n31-mpg123-alsa.sh, and
+# staged where every app that needs it can find it. Its config tree goes into
+# the image separately - alsa-lib resolves even "hw:0" through /usr/share/alsa,
+# so a binary linked against it needs those files present on the device.
+
+IPOD_ROOT ?= /mnt/c/src/ipod/artifacts/linux-n31
+TOOLCHAIN ?= $(IPOD_ROOT)/tinyalsa-build/arm-linux-musleabi-cross
+
+# Which toolchain, and which float ABI.
+#
+# Overridable so a hard-float build can be made without disturbing this one.
+# The default is unchanged and stays unchanged until hard float has been shown
+# to work on hardware: this is what currently boots.
+#
+# softfp is not soft float. The FPU does the arithmetic either way; what the
+# ABI decides is whether a float crossing a function boundary travels in a VFP
+# register or in a pair of integer ones. Hard float cannot simply be switched
+# on here, because musleabi's own libc is built the other way and the link
+# fails with "uses VFP register arguments" - it needs the whole parallel
+# toolchain, and every vendored library rebuilt against it.
+#
+#   make -f Makefile.n31 \
+#     TOOLCHAIN=$(IPOD_ROOT)/toolchain-hf/arm-linux-musleabihf-cross \
+#     TRIPLE=arm-linux-musleabihf FLOAT_ABI=hard BUILD=build-n31-hf
+#
+# BUILD has to differ too. Objects of the two ABIs cannot be linked together -
+# which at least fails loudly rather than quietly - but they would happily
+# share an object directory and confuse every later build.
+TRIPLE    ?= arm-linux-musleabi
+FLOAT_ABI ?= softfp
+
+# Hard-float builds stage under a different name. The soft-float
+# artifact is what mk-initramfs.sh packs, and a parallel ABI
+# experiment must not quietly become the thing that boots.
+STAGE_SUFFIX := $(if $(filter-out softfp,$(FLOAT_ABI)),-$(FLOAT_ABI),)
+ALSA      ?= $(IPOD_ROOT)/alsa
+# Static libdrm, so LVGL can drive /dev/dri/card0 directly. Built once by
+# tools/linux-n31/build-n31-libdrm.sh in the ipod repo.
+LIBDRM    ?= $(IPOD_ROOT)/libdrm
+SSH_KEY   ?= $(IPOD_ROOT)/n31_id
+DEVICE    ?= root@192.168.7.2
+
+CCACHE := $(shell command -v ccache 2>/dev/null)
+CC     := $(CCACHE) $(TOOLCHAIN)/bin/$(TRIPLE)-gcc
+AR     := $(TOOLCHAIN)/bin/$(TRIPLE)-ar
+STRIP  := $(TOOLCHAIN)/bin/$(TRIPLE)-strip
+BUILD  ?= build-n31
+CORE   := ../core
+PLAT   := ../platform
+LVGL   ?= ../../../lvgl
+
+# Compile LVGL from a native mirror rather than across the Windows mount,
+# which is nineteen times faster - see apps/lvgl-mirror.mk.
+include ../../../apps/lvgl-mirror.mk
+
+# Objects live on the native filesystem under a directory named for the hash of
+# the config that produced them - the Windows drive costs more in filesystem
+# time than the compiler costs in CPU, and lv_conf is a tracked file whose mtime
+# moves on every branch switch even when not one byte of it changed.
+LV_CONF    := lv_conf_n31.h
+# The float ABI is part of the key, not just the config: objects of the
+# two ABIs cannot be linked together, and a cache that ignored the
+# difference would hand a hard-float build its soft-float objects.
+LV_CONF_ID := $(shell md5sum $(LV_CONF) 2>/dev/null | cut -c1-12)
+LV_CACHE   ?= $(HOME)/.cache/n31-lvgl/radioplus-n31-$(LV_CONF_ID)-$(FLOAT_ABI)
+# LVGL, minus every platform this target will never be.
+#
+# drivers/display/drm is NOT excluded, and that is the point: this app
+# drives /dev/dri/card0 through it. It used to be on the list, from when
+# LV_USE_LINUX_DRM was 0 and the files compiled to nothing - and leaving
+# it there after turning the backend on cost a link failure with two
+# undefined symbols and no hint as to why.
+LV_SRCS := $(shell find $(LVGL_SRC)/src -name '*.c' \
+             -not -name 'lv_freertos.c' -not -name 'lv_cmsis_rtos2.c' \
+             -not -name 'lv_mqx.c'      -not -name 'lv_rtthread.c' \
+             -not -name 'lv_windows.c'  -not -name 'lv_sdl2.c' \
+             -not -path '*/drivers/nuttx/*'    -not -path '*/drivers/qnx/*' \
+             -not -path '*/drivers/uefi/*'     -not -path '*/drivers/windows/*' \
+             -not -path '*/drivers/wayland/*'  -not -path '*/drivers/x11/*' \
+             -not -path '*/drivers/libinput/*' -not -path '*/drivers/opengles/*' \
+             -not -path '*/drivers/sdl/*' \
+             \
+             -not -path '*/libs/vg_lite_driver/*' \
+             2>/dev/null)
+
+LV_OBJS := $(patsubst $(LVGL_SRC)/%.c,$(LV_CACHE)/%.o,$(LV_SRCS))
+LVLIB   := $(LV_CACHE)/liblvgl_n31.a
+
+ARCH_FLAGS := -mcpu=cortex-a5 -mthumb -mfpu=vfpv4 -mfloat-abi=$(FLOAT_ABI)
+
+CFLAGS := -O2 -g0 -std=gnu99 $(ARCH_FLAGS) \
+          -ffunction-sections -fdata-sections \
+          -Wall -Wextra -Wshadow -Wno-unused-parameter \
+          -I$(ALSA)/include -I$(LIBDRM)/include -I../../n31launcher
+
+LV_CFLAGS := -DLV_CONF_INCLUDE_SIMPLE -DLV_CONF_PATH=\"$(CURDIR)/lv_conf_n31.h\" \
+             -I$(LVGL_SRC) -I$(LVGL_SRC)/src -I$(LVGL_SRC)/include -I$(LVGL_SRC)/.. -I..
+
+CORE_SRCS := $(CORE)/fmcmd.c $(CORE)/fmreg.c $(CORE)/rds.c $(CORE)/rdsname.c \
+             $(CORE)/ctscan.c $(CORE)/region.c \
+             $(CORE)/wav.c $(CORE)/store.c $(CORE)/scan.c $(CORE)/timer.c $(CORE)/affollow.c ../../../apps/build_stamp.c
+
+PLAT_SRCS := $(PLAT)/tuner_linux.c $(PLAT)/capture_linux.c \
+             $(PLAT)/clock_linux.c $(PLAT)/mixer_linux.c \
+             $(PLAT)/player_linux.c $(PLAT)/model_linux.c
+
+APP      := $(BUILD)/radioplus
+APP_SRCS := main_n31.c ../ui.c $(CORE_SRCS) $(PLAT_SRCS) \
+            ../../n31launcher/display.c ../../n31launcher/touch.c
+
+OBJS := $(patsubst %.c,$(BUILD)/%.o,$(notdir $(CORE_SRCS) $(PLAT_SRCS)))
+HDRS := $(wildcard $(CORE)/*.h $(PLAT)/*.h ../*.h)
+
+
+# ---- build stamp -----------------------------------------------------------
+#
+# Which build is this. An app sitting on the device that is months old looks
+# exactly like the one just compiled, right up until an afternoon goes into
+# debugging something that was fixed in April.
+BUILD_STAMP := $(shell date -u +%Y%m%d.%H%M)
+BUILD_GIT   := $(shell git rev-parse --short=7 HEAD 2>/dev/null || echo nogit)
+CFLAGS += -DEN_BUILD_STAMP='"$(BUILD_STAMP)"' -DEN_BUILD_GIT='"$(BUILD_GIT)"'
+
+.PHONY: all app objs push run log stop clean clean-lvgl toolchain-check
+
+# Stated rather than implied: adding a rule above the first target silently
+# makes THAT what a bare `make` builds, and the failure mode is a build that
+# reports success having done nothing.
+.DEFAULT_GOAL := all
+
+all: app
+app: $(APP)
+
+# No lv_conf prerequisite: the cache directory name already carries that file's
+# hash, so a config change selects different objects rather than invalidating
+# these by timestamp.
+$(LV_CACHE)/%.o: $(LVGL_SRC)/%.c
+	@mkdir -p $(dir $@)
+	@$(CC) $(CFLAGS) -w $(LV_CFLAGS) -c -o $@ $<
+
+$(LVLIB): $(LV_OBJS)
+	@echo "  AR  $@"
+	@$(AR) crs $@ $^
+
+# Static, so it needs nothing on the device but a kernel.
+$(APP): $(APP_SRCS) $(HDRS) $(LVLIB) | $(BUILD)
+	@test -f $(LIBDRM)/lib/libdrm.a || { \
+	  echo "no ARM libdrm at $(LIBDRM)/lib/libdrm.a"; \
+	  echo "build it once with build-n31-libdrm.sh in the ipod repo"; \
+	  exit 1; }
+	@test -f $(ALSA)/lib/libasound.a || { \
+	  echo "no ARM alsa-lib at $(ALSA)/lib/libasound.a"; \
+	  echo "build it once with build-n31-mpg123-alsa.sh in the ipod repo"; \
+	  exit 1; }
+	@# -ldl because alsa-lib calls dlopen for its plugins. Statically linked
+	@# against musl those are stubs, which is correct here: every plugin this
+	@# app names is one of the built-ins.
+	$(CC) $(CFLAGS) $(LV_CFLAGS) -static -Wl,--gc-sections \
+	      -o $@ $(APP_SRCS) $(LVLIB) $(ALSA)/lib/libasound.a \
+	      $(LIBDRM)/lib/libdrm.a -ldl -lm -lpthread
+	@$(STRIP) $@
+	@# Stage where the image builder looks, every time, so an image packed
+	@# from the other repo can never be older than the last build here. See
+	@# STAGING in the app READMEs.
+	@mkdir -p $(IPOD_ROOT)
+	@cp -f $@ $(IPOD_ROOT)/radioplus$(STAGE_SUFFIX)
+	@echo "  staged -> $(IPOD_ROOT)/radioplus$(STAGE_SUFFIX)"
+	@ls -l $@
+
+objs: $(OBJS)
+	@echo "compiled $(words $(OBJS)) objects for cortex-a8"
+
+toolchain-check:
+	@test -x $(CC) || { echo "no cross gcc at $(CC)"; exit 1; }
+	@test -d $(ALSA)/include || { echo "no alsa-lib headers at $(ALSA)"; exit 1; }
+	@$(CC) -dumpmachine
+
+$(BUILD):
+	@mkdir -p $(BUILD)
+
+$(BUILD)/%.o: $(CORE)/%.c $(HDRS) | $(BUILD)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+$(BUILD)/%.o: $(PLAT)/%.c $(HDRS) | $(BUILD)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+# The key lives on a Windows-mounted path, which shows as 0777 under WSL, and
+# ssh refuses a world-readable private key. Stage a 0600 copy once.
+KEY := $(HOME)/.ssh/radioplus-n31-key
+
+$(KEY): $(SSH_KEY)
+	@mkdir -p $(dir $(KEY))
+	@cp $(SSH_KEY) $(KEY)
+	@chmod 600 $(KEY)
+
+SSH = ssh -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i $(KEY)
+
+# dropbear on the device has no sftp-server, so scp cannot be used. Piping
+# through ssh needs nothing on the far side but a shell.
+push: $(APP) $(KEY)
+	@$(SSH) $(DEVICE) 'cat > /tmp/radioplus && chmod +x /tmp/radioplus' < $(APP)
+	@$(SSH) $(DEVICE) 'cat > /tmp/radioplus-start && chmod +x /tmp/radioplus-start' < radioplus-start
+	@echo "pushed $(DEVICE):/tmp/radioplus and /tmp/radioplus-start"
+
+stop: $(KEY)
+	-@$(SSH) $(DEVICE) 'for p in $$(ps | grep "[r]adioplus" | while read pid rest; do echo $$pid; done); do kill -9 $$p 2>/dev/null; done; sleep 1; true'
+
+run: stop push
+	@$(SSH) $(DEVICE) '/tmp/radioplus-start 2>&1 | head -40'
+
+clean:
+	rm -rf $(BUILD)
+
+# Leaves the LVGL cache alone, which is the point of it.
+clean-lvgl:
+	rm -rf $(LV_CACHE)

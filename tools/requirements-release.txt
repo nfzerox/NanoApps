@@ -1,0 +1,8 @@
+# The firmware/font builder and host verification dependencies.
+afdko==4.0.2
+pyfatfs==1.1.0
+setuptools==80.10.2
+fonttools==4.68.0
+Pillow==13.0.0
+pyelftools==0.33
+unicorn==2.1.4

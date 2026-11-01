@@ -1,10 +1,16 @@
-/* silver_resident — the resident system daemon. Loads at 0x09130000 and stays
- * in the OS address space to host every homebrew app on the home screen.
+/* silver_resident — the resident system daemon. It stays in the OS address
+ * space to host every homebrew app on the home screen.
  *
- * It installs a small set of OS hooks (re-aimed at this build on every deploy,
- * so a plain re-push takes effect with no power-cycle):
+ * It is a relocatable .hbapp (/Library/resident.hbapp) that the firmware bootstrap
+ * (system/disk_bootstrap) loads into its own OS-heap block, once per boot. It
+ * owns NO fixed DRAM: 0x0910xxxx-0x094xxxxx is all live OS heap, so every
+ * trampoline, vtable copy, timer object, flag and the trace ring lives in this
+ * image's .bss, and the state apps share is one hb_shared_t (hb_shared.h)
+ * passed to each app's entry.
+ *
+ * It installs a small set of OS hooks:
  *   - home controller action dispatch slot (vtable 0x087cb9dc, +0x190): runs in
- *     UI-task context; (re)registers the on-disk app pack (/Apps/AllApps.pack)
+ *     UI-task context; (re)registers the on-disk app pack (/Library/AllApps.pack)
  *     and builds the launch registry. Forwards to the original 0x082ae8dd.
  *   - raw message hook: claims our "sbitem.hb." taps and launches the app.
  *   - the resource-DB lookup trampoline: serves our compiled screen DB for our
@@ -19,6 +25,7 @@
  * records, so nothing here is hardcoded per app.
  */
 #include "hb_sdk.h"
+#include "compat_fixes.h"
 #include "hb_silver_res.h"
 #include "hb_silver_uitask.h"
 #include "hb_silver_icon.h"
@@ -30,20 +37,128 @@
 #include "hb_heap.h"
 #include "hb_record.h"
 #include "hb_app_bundle.h"
+#include "hb_app_catalog.h"
+#include "hb_shared.h"
+#include "hb_sysfx.h"
+
+#define HB_MAX_APPS 64   /* registrar arrays + pagination cap (6/page x 10 pages) */
+
+/* The direct-cave boot candidate leaves a read-only C6 reporter at this
+ * firmware-owned address.  Guard every write with its magic so this resident
+ * remains harmless when launched by an older/public bootstrap. */
+#define BOOT_REPORT_BASE             0x086c9b84u
+#define BOOT_REPORT_MAGIC_OFFSET     0x2cu
+#define BOOT_REPORT_MAGIC            0x32505452u
+#define BOOT_REPORT_RESIDENT_OFFSET  0x50u
+#define BOOT_REPORT_REGISTER_OFFSET  0x54u
+#define BOOT_REPORT_APP_COUNT_OFFSET 0x58u
+#define BOOT_REPORT_PRELOAD_OFFSET   0x5cu
+#define BOOT_REPORT_FAILMASK_OFFSET  0x60u
+#define BOOT_REPORT_LAUNCH_OFFSET    0x64u
+#define BOOT_REPORT_APP_ID_OFFSET    0x68u
+#define BOOT_REPORT_APP_KIND_OFFSET  0x6cu
+#define BOOT_REPORT_ENTRY_OFFSET     0x70u
+#define BOOT_REPORT_HEAP_BOOT_FREE_OFFSET    0xa0u
+#define BOOT_REPORT_HEAP_BOOT_LARGEST_OFFSET 0xa4u
+#define BOOT_REPORT_LAUNCH_COUNT_OFFSET      0xa8u
+#define BOOT_REPORT_LAUNCH_LOG_OFFSET        0xacu
+#define BOOT_REPORT_LAUNCH_LOG_WORDS         5u
+#define BOOT_REPORT_LAUNCH_LOG_CAPACITY      8u
+
+static int hb_boot_report_live(void)
+{
+    return *(volatile uint32_t *)(BOOT_REPORT_BASE + BOOT_REPORT_MAGIC_OFFSET) ==
+           BOOT_REPORT_MAGIC;
+}
+
+static void hb_boot_report(uint32_t offset, uint32_t value)
+{
+    if (!hb_boot_report_live())
+        return;
+    *(volatile uint32_t *)(BOOT_REPORT_BASE + offset) = value;
+    __asm__ volatile("dsb sy" : : : "memory");
+}
+
+enum hb_launch_report_result {
+    HB_LAUNCH_LOAD_FAILED = 1,
+    HB_LAUNCH_NEW_STARTED = 2,
+    HB_LAUNCH_REUSED_STARTED = 3,
+    HB_LAUNCH_NEW_ENTRY_FAILED = 4,
+    HB_LAUNCH_REUSED_ENTRY_FAILED = 5,
+};
+
+static uint32_t s_launch_report_count;
+
+/* Each bounded record is: sequence, app id, result, free heap, largest block. */
+static void hb_report_launch_memory(uint32_t app_id, uint32_t result)
+{
+    if (!hb_boot_report_live())
+        return;
+    uint32_t sequence = ++s_launch_report_count;
+    uint32_t index = (sequence - 1u) % BOOT_REPORT_LAUNCH_LOG_CAPACITY;
+    uint32_t offset = BOOT_REPORT_LAUNCH_LOG_OFFSET +
+        index * BOOT_REPORT_LAUNCH_LOG_WORDS * 4u;
+    hb_boot_report(BOOT_REPORT_LAUNCH_COUNT_OFFSET, sequence);
+    hb_boot_report(offset + 0u, sequence);
+    hb_boot_report(offset + 4u, app_id);
+    hb_boot_report(offset + 8u, result);
+    hb_boot_report(offset + 12u, hb_os_heap_free());
+    hb_boot_report(offset + 16u, hb_os_heap_largest());
+}
+
+/* The state apps share with us (touch mailbox, aux block, Screenshot toggles,
+ * trace logger). hb_shared points here from the first line of payload_entry. */
+static hb_shared_t s_shared;
 
 /* The apps come from the on-disk pack — ids, labels, and icons live in each
  * launch record, not here. Setup runs in the (proven-stable) ACTION hook; the
  * RAW-MESSAGE hook claims our taps; the icon registrar EXTENDS the bitmap cache
  * table and serves our bitmaps at appended ids past the OS range. */
-#define FLAG_ADDR      0x09135ffcu   /* per-deploy icon-serve guard (cleared at entry) */
+static uint8_t s_hooks_patched;   /* firmware function patches applied (action_hook) */
+
+/* The trace ring lives in our .bss and is published through the C6/98 boot
+ * report for host reads. On the next boot, entry can also find
+ * the PREVIOUS boot's ring by scanning DRAM (DRAM survives a panic reboot),
+ * copy it here, and let action_hook write the copy to disk — one write per boot,
+ * never on the UI event path. Decode with tools/decode_lasttrace.py. */
+#define LASTTRACE_PATH  "/Library/lasttrace.bin"
+static uint32_t s_trace_ring[HB_TRACE_BYTES / 4u] __attribute__((aligned(16)));
+static uint32_t s_prev_ring[HB_TRACE_BYTES / 4u] __attribute__((aligned(16)));
+static uint8_t  s_prev_found;     /* s_prev_ring holds the previous boot's ring */
+
+static void save_last_trace(void)
+{
+    /* This candidate has a host-readable boot reporter, so avoid the legacy
+     * one-write-per-boot trace file during the controlled untether test. */
+    if (hb_boot_report_live())
+        return;
+    if (!s_prev_found)
+        return;
+    s_prev_found = 0;
+    hb_fs_write(LASTTRACE_PATH, s_prev_ring, HB_TRACE_BYTES);
+    s_prev_ring[0] = 0;           /* a stale copy must not win a later scan */
+}
 
 /* Our OWN screen: a precompiled resource DB (SCRN/SCST/SLst/...) for
  * HBCustom_Screen, injected into the chain so the factory can build it (the
  * template's canvas is empty, so our injected view is the only content). The DB
  * ships inside the app pack; hb_app_register_pack registers it using the object
- * + chain-node scratch below. */
-#define SILVERDB_OBJ   0x09137000u   /* resource-db object storage            */
-#define SILVERDB_NODE  0x09137100u   /* chain node for our screen DB          */
+ * + chain-node storage below. */
+static uint8_t s_silverdb_obj[0x100]  __attribute__((aligned(8)));  /* resource-db object */
+static uint8_t s_silverdb_node[0x100] __attribute__((aligned(8)));  /* its chain node     */
+#define SILVERDB_OBJ   ((void *)s_silverdb_obj)
+#define SILVERDB_NODE  ((void *)s_silverdb_node)
+
+/* Function-patch trampolines (the callable originals): the relocated stock
+ * prologue plus a jump back. Code, in our .bss — this heap block is where the
+ * OS already runs every app from. */
+static uint8_t s_getres_tramp[32]      __attribute__((aligned(8)));
+static uint8_t s_posttouch_tramp[32]   __attribute__((aligned(8)));
+static uint8_t s_dtts_tramp[24]        __attribute__((aligned(8)));
+static uint8_t s_batt_level_tramp[16]  __attribute__((aligned(8)));
+static uint8_t s_batt_status_tramp[16] __attribute__((aligned(8)));
+#define TRAMP(t)  ((uint32_t)(uintptr_t)(t) | 1u)
+
 /* Screen/layout ids come from each app's launch record (the bundle), so the
    resident doesn't hardcode them. The compiled resource DB (tools/screens) has one
    surface screen 229474306 / layout 229474305. */
@@ -57,7 +172,9 @@
  * position-independent for 10 bytes (first branch at +0x0e). */
 #define ADDR_GETRESOURCE   0x08409e86u
 #define GETRES_PROLOGUE0   0xb5f8u    /* 'push {r3-r7,lr}' — unpatched marker  */
-#define GETRES_TRAMP_ADDR  0x09137200u /* trampoline (callable original resource getter) */
+static const uint8_t GETRES_STOCK[10] = {
+    0xf8, 0xb5, 0x04, 0x46, 0x00, 0x78, 0x1d, 0x46, 0x0e, 0x46
+};
 
 typedef const void *(*getres_t)(void *db, uint32_t type, long id, uint32_t *size);
 
@@ -67,24 +184,25 @@ static const void *getres_hook(void *db, uint32_t type, long id, uint32_t *size)
     /* serve our compiled screen's resources (our id range) from our injected DB
      * — which the main SilverDB lacks; forward everything else unchanged. */
     if ((uint32_t)id >= OUR_ID_BASE) {
-        const void *r = ((getres_t)(GETRES_TRAMP_ADDR | 1u))((void *)SILVERDB_OBJ,
-                                                             type, id, size);
+        const void *r = ((getres_t)TRAMP(s_getres_tramp))(SILVERDB_OBJ, type, id, size);
         if (r)
             return r;
     }
-    return ((getres_t)(GETRES_TRAMP_ADDR | 1u))(db, type, id, size);
+    return ((getres_t)TRAMP(s_getres_tramp))(db, type, id, size);
 }
 
 /* Event-path touch: hook the touch manager's touch-posting entry (called for EVERY touch event,
  * before it drains the hardware touch list). We read the raw touch list at
  * that moment and LATCH a mailbox the LVGL surface indev reads — so a tap is
  * never missed (vs polling the transient list, which only caught ~1/4 of taps).
- * Mailbox: [magic, x, y, pressed] at 0x09135f40 (matches hb_lv_surface.c). */
+ * Mailbox: [magic, x, y, pressed] in s_shared.touch (read by hb_touch_mb.c). */
 #define ADDR_POSTTOUCH     0x084a27f6u
 #define POSTTOUCH_PROLOGUE 0xe92du        /* 'stmdb sp!,{r1-r9,lr}' — unpatched   */
-#define POSTTOUCH_TRAMP    0x09137c00u    /* callable original touch-posting entry        */
+static const uint8_t POSTTOUCH_STOCK[12] = {
+    0x2d, 0xe9, 0xfe, 0x43, 0x04, 0x46, 0x00, 0x68,
+    0xd0, 0xf8, 0xc4, 0x10
+};
 #define TOUCH_LIST_HEAD    0x089a5298u
-#define TOUCH_MB_ADDR      HB_TOUCH_MB_ADDR    /* shared writer/reader mailbox (hb_touch_mb.h) */
 #define TOUCH_MB_MAGIC     HB_TOUCH_MB_MAGIC
 typedef int (*posttouch_t)(void *self);
 
@@ -92,7 +210,7 @@ __attribute__((section(".text.hook"), used, noinline))
 static int hb_posttouch_hook(void *self)
 {
     volatile uint32_t *head = (volatile uint32_t *)TOUCH_LIST_HEAD;
-    volatile int32_t  *mb   = (volatile int32_t *)TOUCH_MB_ADDR;
+    volatile int32_t  *mb   = s_shared.touch;
     if (head[5] != 0) {
         uint32_t end_node = head[4], first;
         if (end_node >= 0x08000000u && end_node < 0x10000000u) {
@@ -110,7 +228,7 @@ static int hb_posttouch_hook(void *self)
         mb[3] = 0;                                   /* no touch -> released */
         mb[0] = (int32_t)TOUCH_MB_MAGIC;
     }
-    return ((posttouch_t)(POSTTOUCH_TRAMP | 1u))(self);
+    return ((posttouch_t)TRAMP(s_posttouch_tramp))(self);
 }
 
 /* System-wide screenshot on triple-click Home.
@@ -127,15 +245,14 @@ static int hb_posttouch_hook(void *self)
  * verbatim. The reimplementation follows the disassembled original: read the current
  * springboard view (0x083f4dfc); if there is none, or it is not in edit mode (its
  * vtable slot at +0x268 reports false), invoke the OS accessibility-shortcut
- * handler. The toggle is a plain RAM byte the Screenshot app writes
- * (resets to off on reboot). */
+ * handler. The toggle is s_shared.screenshot_mode, which the Screenshot app
+ * writes (screenshot mode again after every boot). */
 #define A_HOME_TRIPLE         0x08241750u  /* Home triple-click handler entry             */
 #define A_SCREENSHOT_KEY      0x08240860u  /* display-capture entry (self = controller)   */
 #define A_GET_CUR_SBVIEW      0x083f4dfcu  /* read the current springboard view           */
 #define SBVIEW_EDITING_OFF 0x268u       /* slot we read as the edit mode flag (the original gates on its false return) */
 #define A_ACCESS_GETINST      0x082a80f4u  /* OS accessibility-shortcut handler getter    */
 #define A_ACCESS_ON_TRIPLE    0x082a82a0u  /* accessibility triple-click handler(self)    */
-#define SCREENSHOT_FLAG_ADDR  0x09135ff0u  /* RAM toggle: 1 => triple-click Home screenshots   */
 
 typedef void *(*getvoid_t)(void);
 typedef int   (*int_self_t)(void *self);
@@ -146,7 +263,7 @@ typedef void  (*void_self_t)(void *self);
  * entirely (the timer hook, its install, and the record branch below); screenshots
  * still work, recording just becomes unavailable. */
 #ifndef HB_REC_INTERCEPT
-#define HB_REC_INTERCEPT 1
+#define HB_REC_INTERCEPT 0
 #endif
 
 #if HB_REC_INTERCEPT
@@ -156,7 +273,7 @@ static void hb_rec_timer_arm(void);   /* defined below (with the capture timer) 
 __attribute__((section(".text.hook"), used, noinline))
 static void hb_home_triple_hook(void *self)
 {
-    uint8_t mode = *(volatile uint8_t *)SCREENSHOT_FLAG_ADDR;  /* 0 off,1 shot,2 rec */
+    uint8_t mode = s_shared.screenshot_mode;  /* 0 off,1 shot,2 rec */
     if (mode == 1u) {
         ((void_self_t)(A_SCREENSHOT_KEY | 1u))(self);   /* /screenshotNNNN.bmp */
         return;
@@ -191,12 +308,14 @@ static void hb_home_triple_hook(void *self)
  * formats. When the toggle is on we SWAP the date-time arg for a fixed 9:41 and let
  * the original format it (so encoding/locale stay correct); fmt is r3 (4th arg).
  * The status bar uses the 0x084a9adc overload, whose prologue has a PC-relative ldr
- * at +6 — it can't take the 10-byte trampoline jump, so it's patched with a 4-byte
- * B.W (relocating only the 4-byte stmdb). Runs per clock re-format (~per minute). */
-#define STATUSBAR_FLAG_ADDR 0x09135fecu   /* RAM toggle: 1 => demo status bar (9:41)          */
+ * at +6. Its trampoline redirects that literal load to an adjacent copy, then
+ * returns with an absolute jump. Runs per clock re-format (~per minute). */
 #define A_DTTS              0x084a9adcu    /* OS date/time-to-string formatter: out buffer, size, format, date-time */
 #define DTTS_PROLOGUE       0xe92du        /* stmdb sp!,{...} — unpatched marker               */
-#define DTTS_TRAMP_ADDR     0x09137b80u    /* callable original (free DRAM slot)               */
+static const uint8_t DTTS_RELOCATED[8] = {
+    0x2d, 0xe9, 0xff, 0x5f, 0x04, 0x46, 0x02, 0x48
+}; /* push; mov r4,r0; ldr r0,[pc,#8] -> trampoline+16 */
+#define DTTS_LITERAL 0x084a9c5cu
 #define CLOCK_FMT_A         19   /* the two format ids that render the short HH:MM clock     */
 #define CLOCK_FMT_B         20   /* string; pinned by watching which id reaches this call    */
 typedef int (*dtts_t)(void *self, void *out, unsigned size, int fmt, const void *dt);
@@ -209,10 +328,9 @@ static const struct { uint8_t s, mi, h, d, mo; uint16_t y; uint8_t w; } k_dt941 
 __attribute__((section(".text.hook"), used, noinline))
 static int hb_dtts_hook(void *self, void *out, unsigned size, int fmt, const void *dt)
 {
-    if (*(volatile uint8_t *)STATUSBAR_FLAG_ADDR &&
-        (fmt == CLOCK_FMT_A || fmt == CLOCK_FMT_B))
+    if (s_shared.statusbar_demo && (fmt == CLOCK_FMT_A || fmt == CLOCK_FMT_B))
         dt = &k_dt941;
-    return ((dtts_t)(DTTS_TRAMP_ADDR | 1u))(self, out, size, fmt, dt);
+    return ((dtts_t)TRAMP(s_dtts_tramp))(self, out, size, fmt, dt);
 }
 
 /* Same "Demo bar" toggle: 100% battery, not charging. the power-status view's update
@@ -220,14 +338,18 @@ static int hb_dtts_hook(void *self, void *out, unsigned size, int fmt, const voi
  * overlay (chosen from a power-status index — the charging bolt; the 'unknown'
  * status draws no overlay). Plugged into the host the iPod is charging, so it shows
  * full + a bolt. So we force the level to its maximum (full) and the status to
- * 'unknown' (no bolt). Both getters have a PC-relative op within 10 bytes, so use the 4-byte
- * B.W patch (relocate the 4-byte push+mov prologue, leave the PC-rel op in place).
+ * 'unknown' (no bolt). Both getters have eight position-independent entry bytes;
+ * an eight-byte absolute jump leaves their following branches/literals in place.
  * Like the clock, the icon re-picks on the next power-status update (battery poll). */
 #define A_BATT_LEVEL        0x08215684u   /* returns a level index into battery artwork */
 #define A_BATT_STATUS       0x08215600u   /* returns a status index for overlay select       */
 #define BATT_PROLOGUE       0xb570u       /* push {r4,r5,r6,lr} — unpatched marker     */
-#define BATT_LEVEL_TRAMP    0x09137b00u
-#define BATT_STATUS_TRAMP   0x09137b40u
+static const uint8_t BATT_LEVEL_STOCK[8] = {
+    0x70, 0xb5, 0x1e, 0x24, 0xd0, 0xf8, 0x9c, 0x01
+};
+static const uint8_t BATT_STATUS_STOCK[8] = {
+    0x70, 0xb5, 0x05, 0x46, 0x1e, 0x24, 0x95, 0x20
+};
 #define BATT_LEVEL_FULL     22   /* level index that renders as a full battery (observed)  */
 #define BATT_STATUS_NONE    30   /* status index that draws no charge overlay (observed)   */
 typedef int (*batt_t)(void *self);
@@ -235,17 +357,17 @@ typedef int (*batt_t)(void *self);
 __attribute__((section(".text.hook"), used, noinline))
 static int hb_batt_level_hook(void *self)
 {
-    if (*(volatile uint8_t *)STATUSBAR_FLAG_ADDR)
+    if (s_shared.statusbar_demo)
         return BATT_LEVEL_FULL;
-    return ((batt_t)(BATT_LEVEL_TRAMP | 1u))(self);
+    return ((batt_t)TRAMP(s_batt_level_tramp))(self);
 }
 
 __attribute__((section(".text.hook"), used, noinline))
 static int hb_batt_status_hook(void *self)
 {
-    if (*(volatile uint8_t *)STATUSBAR_FLAG_ADDR)
+    if (s_shared.statusbar_demo)
         return BATT_STATUS_NONE;
-    return ((batt_t)(BATT_STATUS_TRAMP | 1u))(self);
+    return ((batt_t)TRAMP(s_batt_status_tramp))(self);
 }
 
 typedef int (*rawmsg_t)(void *self, void *msg);
@@ -260,8 +382,9 @@ typedef int (*dispatch_t)(void *self, const char *name, void *msg);
  * and point our view at the copy. */
 #define DRAW_SLOT_OFF  0xbcu       /* draw-callback slot (found by overriding it and
                                      watching the view repaint); other slots unmapped */
-#define VTABLE_COPY_ADDR   0x09137300u   /* our patched vtable copy */
 #define VTABLE_COPY_SIZE   0x800u        /* generous (over-copy is safe; under is not) */
+static uint32_t s_vtable_copy[VTABLE_COPY_SIZE / 4u] __attribute__((aligned(8)));
+#define VTABLE_COPY_ADDR   ((uint32_t)(uintptr_t)s_vtable_copy)   /* our patched vtable copy */
 #define A_TGFX_CTOR        0x084243dcu   /* the gfx constructor */
 #define A_TGFX_DTOR        0x0841abfcu   /* gfx object destructor */
 #define A_FOCUS_EXBORDER   0x084035e4u   /* the view's inner focus-rect (takes a gfx context) */
@@ -279,15 +402,11 @@ typedef int (*dispatch_t)(void *self, const char *name, void *msg);
 #define A_TIMER_START      0x0842484cu   /* event server start timer(t)             */
 #define A_TIMER_STOP       0x0841c42cu   /* event server stop timer(t)              */
 #define A_TIMER_DESTROY    0x0841cd68u   /* event server destroy timer(t), unregister */
-#define TIMER_ADDR         0x09135c00u   /* OS timer object storage (survives re-exec) */
-#define TIMER_MAGIC_ADDR   0x09135c80u   /* 'TIMR' when our timer is live          */
-#define TIMER_MAGIC        0x54494d52u
-/* Redraw heartbeat. The timer only Invals; the OS draws at its ~60 Hz
- * refresh. It is one-shot and re-armed when its message is handled, so the
- * period counts from that moment. At 16 ms (just under a 16.7 ms refresh) a
- * little latency made the next Inval land just after a refresh, and surfaces
- * locked at 30 Hz for seconds. Half a refresh can't miss one. */
-#define TIMER_PERIOD_MS    8u
+static uint8_t  s_timer[128] __attribute__((aligned(8)));   /* OS timer object storage */
+static uint32_t s_timer_magic;           /* TIMER_MAGIC while our timer is live    */
+#define TIMER_ADDR         ((void *)s_timer)
+#define TIMER_MAGIC        0x54494d52u   /* 'TIMR' */
+#define TIMER_PERIOD_MS    8u           /* ~60 fps redraw heartbeat                */
 #define CLTIMERMSG         16u           /* timer message type (the message type field, NOT timer message) */
 #define MSG_FTYPE_OFF      4u            /* the message type field (after the vtable ptr)      */
 #define MSG_SLOT_OFF 0x40u         /* view message-handler slot (we patch it to catch messages) */
@@ -336,32 +455,40 @@ static void hb_fill_test_pattern(uint32_t *fb)
         }
 }
 
-/* In-heap app binary for the current CUSTOM_SCREEN app (set on launch); copied to
- * the fixed surface VA and run. 0 = built-in gradient. */
+/* The current CUSTOM_SCREEN app (set on launch). 0 = built-in gradient. */
 static uint32_t s_surface_code;
 static uint32_t s_surface_code_len;
-/* For a relocatable .hbapp (HB_RELOC_MAGIC): the entry returned by hb_reloc_load
- * after the blob is rebased into an operator-new arena. 0 = use the legacy
- * fixed-VA path (raw .bin copied to LV_SURFACE_VA). s_surface_arena is the
- * arena's allocation, freed (matched free) when the next app loads — without
- * this each app-switch leaks ~1 MB and the heap exhausts after a few launches. */
+/* The entry returned by hb_reloc_load_file after the .hbapp is rebased into its
+ * own retained heap arena. s_surface_arena points at the current app's arena;
+ * the per-app owner remains in s_app_arena[] until reboot. */
 static void    *s_surface_reloc_entry;
 static void    *s_surface_arena;
-/* An arena whose free was deferred from quit-time to the next launch — see
- * hb_surface_teardown for why. At most one outstanding at a time. */
-static void    *s_pending_free_arena;
+/* Executable app arenas are retained for the boot. Only app-owned auxiliary
+ * data is deferred until the next launch so the GPU can finish the exit frame. */
+static void    *s_pending_free_aux;
 #define ADDR_OP_DELETE  0x0842d86cu   /* the OS heap free entry */
 typedef void (*opdelete_t)(void *);
 static uint32_t s_cur_app_id;       /* app whose binary is currently in the slot */
+static uint16_t s_cur_app_kind = HB_APP_KIND_CUSTOM_SCREEN;
+static uint8_t  s_cur_exec_load_state; /* 1 = newly loaded, 2 = retained/reused */
 
 /* Reclaim a deferred arena (hb_surface_teardown stashes it here at quit). Only
  * safe once the exit transition that was in flight at quit has finished — i.e. at
  * the next launch, by which point the GPU has flushed the quit app's last frame. */
+/* Free the unloading app's HB_APP_AUX_BLOCK (see hb_heap.h) with its arena. */
+static void hb_free_app_aux(void)
+{
+    if (HB_APP_AUX_BLOCK) {
+        ((opdelete_t)(ADDR_OP_DELETE | 1u))(HB_APP_AUX_BLOCK);
+        HB_APP_AUX_BLOCK = 0;
+    }
+}
+
 static void hb_surface_drain_pending(void)
 {
-    if (s_pending_free_arena) {
-        ((opdelete_t)(ADDR_OP_DELETE | 1u))(s_pending_free_arena);
-        s_pending_free_arena = 0;
+    if (s_pending_free_aux) {
+        ((opdelete_t)(ADDR_OP_DELETE | 1u))(s_pending_free_aux);
+        s_pending_free_aux = 0;
     }
 }
 
@@ -397,12 +524,14 @@ __attribute__((section(".text.hook"), used, noinline))
 static int hb_msg_hook(void *self, void *msg)
 {
     if (msg && *(uint32_t *)((char *)msg + MSG_FTYPE_OFF) == CLTIMERMSG) {
+        /* A posted tick can outlive stop/destroy while a cached view exits. */
+        if (s_timer_magic != TIMER_MAGIC || self != s_surface_view) return 1;
         /* Timer context (possibly off the draw task): do ONLY cheap, safe work —
          * mark the view dirty + re-arm. The heavy lv_timer_handler + blit runs in
          * draw_hook on the OS's draw task (where it's proven safe at init).
          * (No per-tick trace here, it flooded the ring.) */
         ((gfx0_t)(A_VIEW_INVAL | 1u))(self);                /* schedule a redraw   */
-        ((timer1_t)(A_TIMER_START | 1u))((void *)TIMER_ADDR);   /* repeat          */
+        ((timer1_t)(A_TIMER_START | 1u))(TIMER_ADDR);           /* repeat          */
         return 1;
     }
     return s_orig_msg ? s_orig_msg(self, msg) : 0;
@@ -410,15 +539,15 @@ static int hb_msg_hook(void *self, void *msg)
 
 static void hb_surface_start_timer(void *view)
 {
-    void *t = (void *)TIMER_ADDR;
+    void *t = TIMER_ADDR;
     uint32_t i;
-    for (i = 0; i < 128u; i++)                              /* zero the timer obj  */
+    for (i = 0; i < sizeof s_timer; i++)                    /* zero the timer obj  */
         ((uint8_t *)t)[i] = 0;
     s_surface_view = view;
     ((timer_ctor_t)(A_TIMER_CTOR | 1u))(t, view, 0, 0);     /* bind to our view    */
     ((timer_set_t)(A_TIMER_SET | 1u))(t, (long long)TIMER_PERIOD_MS);
     ((timer1_t)(A_TIMER_START | 1u))(t);
-    *(uint32_t *)TIMER_MAGIC_ADDR = TIMER_MAGIC;
+    s_timer_magic = TIMER_MAGIC;
     hb_trace_log("TIMRSTRT", (uint32_t)(uintptr_t)view, TIMER_PERIOD_MS);
 }
 
@@ -426,10 +555,10 @@ static void hb_surface_start_timer(void *view)
  * arming flag so the NEXT launch starts a fresh timer. */
 static void hb_surface_stop_timer(void)
 {
-    if (*(uint32_t *)TIMER_MAGIC_ADDR == TIMER_MAGIC) {
-        ((timer1_t)(A_TIMER_STOP | 1u))((void *)TIMER_ADDR);     /* disarm        */
-        ((timer1_t)(A_TIMER_DESTROY | 1u))((void *)TIMER_ADDR);  /* unregister    */
-        *(uint32_t *)TIMER_MAGIC_ADDR = 0;
+    if (s_timer_magic == TIMER_MAGIC) {
+        ((timer1_t)(A_TIMER_STOP | 1u))(TIMER_ADDR);             /* disarm        */
+        ((timer1_t)(A_TIMER_DESTROY | 1u))(TIMER_ADDR);          /* unregister    */
+        s_timer_magic = 0;
     }
     s_timer_started = 0;
     s_surface_view = 0;
@@ -464,12 +593,12 @@ static void hb_visibility_hook(void *self, int show)
  * slot so a resident redeploy reaims safely (a patched slot points into our
  * region; an OS address means the slot is still pristine). */
 #define A_GLOBAL_CNTLR_GET   0x083fb524u  /* the singleton getter */
-#define REC_TIMER_ADDR       0x09135d00u  /* OS timer object storage (persists) */
-#define REC_ORIG_HM_ADDR     0x09135d8cu  /* persisted stock global-cntlr message handler */
+static uint8_t  s_rec_timer[128] __attribute__((aligned(8)));  /* OS timer object */
+static uint32_t s_rec_orig_hm;            /* stock global-cntlr message handler */
+#define REC_TIMER_ADDR       ((void *)s_rec_timer)
 #define REC_PERIOD_MS        12u           /* +~25ms msg latency +capture -> ~25 fps */
 #define TMSG_TIMER_TYPE      16u           /* the message type field for timer-message */
 #define TMSG_FTIMER_OFF      8u            /* the timer-message's timer field (str r4,[r0,#8]) */
-#define RESIDENT_REGION_LO   0x09130000u
 
 static msg_fn_t s_orig_gc_msg;
 
@@ -478,18 +607,18 @@ static int hb_rec_gc_msg_hook(void *self, void *msg)
 {
     if (msg
         && *(uint32_t *)((char *)msg + MSG_FTYPE_OFF) == TMSG_TIMER_TYPE
-        && *(void **)((char *)msg + TMSG_FTIMER_OFF) == (void *)REC_TIMER_ADDR) {
+        && *(void **)((char *)msg + TMSG_FTIMER_OFF) == REC_TIMER_ADDR) {
         if (hb_record_active()) {
             hb_record_tick();                                       /* capture frame */
-            ((timer1_t)(A_TIMER_START | 1u))((void *)REC_TIMER_ADDR);  /* re-arm     */
+            ((timer1_t)(A_TIMER_START | 1u))(REC_TIMER_ADDR);          /* re-arm     */
         }
         return 1;                                       /* consume our timer message */
     }
     return s_orig_gc_msg ? s_orig_gc_msg(self, msg) : 0;
 }
 
-/* Install the singleton-controller message handler filter once per deploy (no timer yet).
- * Re-aim safe: a patched slot points into our region; an OS address is pristine. */
+/* Install the singleton-controller message handler filter once per boot (no timer
+ * yet). Re-install safe: only a slot that isn't already our hook is saved. */
 static void hb_rec_install(void)
 {
     void *g = ((getvoid_t)(A_GLOBAL_CNTLR_GET | 1u))();
@@ -497,13 +626,13 @@ static void hb_rec_install(void)
     if (!g) return;
     gvt = *(uint32_t **)g;
     slot = gvt[MSG_SLOT_OFF / 4u];
-    if (slot < RESIDENT_REGION_LO)
-        *(uint32_t *)REC_ORIG_HM_ADDR = slot;
-    s_orig_gc_msg = (msg_fn_t)(uintptr_t)(*(uint32_t *)REC_ORIG_HM_ADDR);
+    if (slot != (((uint32_t)(uintptr_t)&hb_rec_gc_msg_hook) | 1u))
+        s_rec_orig_hm = slot;
+    s_orig_gc_msg = (msg_fn_t)(uintptr_t)s_rec_orig_hm;
     gvt[MSG_SLOT_OFF / 4u] =
         ((uint32_t)(uintptr_t)&hb_rec_gc_msg_hook) | 1u;
     hb_icache_invalidate((uint32_t)(uintptr_t)gvt, MSG_SLOT_OFF + 8u);
-    hb_trace_log("RECINST ", (uint32_t)(uintptr_t)g, *(uint32_t *)REC_ORIG_HM_ADDR);
+    hb_trace_log("RECINST ", (uint32_t)(uintptr_t)g, s_rec_orig_hm);
 }
 
 /* Arm the capture timer (bound to the singleton). Called on record START;
@@ -511,10 +640,10 @@ static void hb_rec_install(void)
 static void hb_rec_timer_arm(void)
 {
     void *g = ((getvoid_t)(A_GLOBAL_CNTLR_GET | 1u))();
-    void *t = (void *)REC_TIMER_ADDR;
+    void *t = REC_TIMER_ADDR;
     uint32_t i;
     if (!g) return;
-    for (i = 0; i < 128u; i++) ((uint8_t *)t)[i] = 0;
+    for (i = 0; i < sizeof s_rec_timer; i++) ((uint8_t *)t)[i] = 0;
     ((timer_ctor_t)(A_TIMER_CTOR | 1u))(t, g, 0, 0);     /* (timer, singleton cntlr, 0, 0) */
     ((timer_set_t)(A_TIMER_SET | 1u))(t, (long long)REC_PERIOD_MS);
     ((timer1_t)(A_TIMER_START | 1u))(t);
@@ -578,15 +707,12 @@ static void hb_surface_teardown(void)
     hb_surface_stop_timer();
     s_gl_frame_fn   = 0;
     s_surface_frame = 0;
-    /* DEFER the arena free rather than doing it here. At exit-begin handler the exit
-     * transition is only just starting and the GPU (a deferred tile renderer) may
-     * still have the app's last GL/LVGL frame queued against this arena — freeing
-     * it now is a use-after-free that crashes during the transition (the OpenGL
-     * quit crash). Stash it and reclaim at the next launch, once the transition has
-     * completed and the GPU has flushed. Bounded to one outstanding arena: any
-     * prior pending one is drained before we stash a new one. */
+    /* Executable arenas stay allocated and are reused without rewriting for
+     * the rest of this boot. Defer only the app's auxiliary data until the GPU
+     * has finished the exit transition. */
     hb_surface_drain_pending();
-    s_pending_free_arena = s_surface_arena;
+    s_pending_free_aux = HB_APP_AUX_BLOCK;
+    HB_APP_AUX_BLOCK = 0;
     s_surface_arena = 0;
     s_cur_app_id = 0;
 }
@@ -607,37 +733,30 @@ static void hb_exit_hook(void *self, int dst)
 }
 
 
-/* Fixed-VA LVGL surface: the app's code section (a binary linked at LV_SURFACE_VA
- * = 0x09280000) is copied there, I-cache flushed, then entry(0, fb, w, h) is
- * called and returns the per-frame fn. No relocation, no api callout table (the
- * relocatable-blob path corrupted LVGL — the relocatable-blob path corrupted LVGL's pool). Each app
- * is its own self-contained binary overwriting the slot, so switching apps just
- * re-copies + re-inits LVGL fresh. */
-#define LV_SURFACE_VA   0x09280000u
-#define LV_SURFACE_MAX  0x90000u        /* 576 KB slot (surface .bins are 200-450 KB) */
+/* Run the current surface app: hb_reloc_load_file already copied + rebased the
+ * image into its own heap arena (and flushed its I-cache), so just call the
+ * entry with our framebuffer and shared block; it returns the per-frame fn. */
 static int hb_run_surface_blob(void)
 {
-    typedef void *(*lvsurf_entry_t)(int op, void *fb, int w, int h);
-    void *fn;
-    if (!s_fb || !s_surface_code || !s_surface_code_len)
+    if (!s_fb || !s_surface_code || !s_surface_reloc_entry)
         return 0;
-    if (s_surface_reloc_entry) {
-        /* Relocatable blob: hb_reloc_load already copied+rebased the image into
-         * an operator-new arena (and flushed its I-cache). Just call the rebased
-         * entry — the app runs entirely from OS-heap memory, no fixed VA. */
-        hb_trace_log("SURFRELO", (uint32_t)(uintptr_t)s_surface_reloc_entry, s_surface_code_len);
-        fn = ((lvsurf_entry_t)s_surface_reloc_entry)(0, s_fb, FB_W, FB_H);
-        s_surface_frame = (surface_frame_t)(uintptr_t)fn;
-        hb_trace_log("SURFRUN ", (uint32_t)(uintptr_t)s_surface_frame, 0);
-        return s_surface_frame ? 1 : 0;
-    }
-    /* the app binary was read to LV_SURFACE_VA by hb_app_launch; flush the
-     * I-cache for the freshly written code, then call its entry. */
-    hb_icache_invalidate(LV_SURFACE_VA, LV_SURFACE_MAX);
-    hb_trace_log("SURFLOAD", LV_SURFACE_VA, s_surface_code_len);
-    fn = ((lvsurf_entry_t)(LV_SURFACE_VA | 1u))(0, s_fb, FB_W, FB_H);
-    s_surface_frame = (surface_frame_t)(uintptr_t)fn;
+    hb_trace_log("SURFRELO", (uint32_t)(uintptr_t)s_surface_reloc_entry, s_surface_code_len);
+    s_surface_frame = (surface_frame_t)(uintptr_t)
+        ((hb_surface_entry_t)s_surface_reloc_entry)(0, s_fb, FB_W, FB_H, &s_shared);
     hb_trace_log("SURFRUN ", (uint32_t)(uintptr_t)s_surface_frame, 0);
+    if (s_surface_frame) {
+        hb_boot_report(BOOT_REPORT_LAUNCH_OFFSET, 1);
+        hb_boot_report(BOOT_REPORT_APP_ID_OFFSET, s_cur_app_id);
+        hb_boot_report(BOOT_REPORT_APP_KIND_OFFSET, s_cur_app_kind);
+        hb_boot_report(BOOT_REPORT_ENTRY_OFFSET,
+                       (uint32_t)(uintptr_t)s_surface_reloc_entry);
+    }
+    hb_report_launch_memory(s_cur_app_id,
+        s_surface_frame
+            ? (s_cur_exec_load_state == 1u ? HB_LAUNCH_NEW_STARTED
+                                           : HB_LAUNCH_REUSED_STARTED)
+            : (s_cur_exec_load_state == 1u ? HB_LAUNCH_NEW_ENTRY_FAILED
+                                           : HB_LAUNCH_REUSED_ENTRY_FAILED));
     return s_surface_frame ? 1 : 0;
 }
 
@@ -648,7 +767,7 @@ static void hb_gfx_ensure(void)
     if (s_gfx_ready)
         return;
     if (!s_fb)
-        s_fb = (uint32_t *)((opnew_t)(ADDR_OP_NEW | 1u))(FB_W * FB_H * 4u);
+        s_fb = (uint32_t *)hb_os_alloc(FB_W * FB_H * 4u);   /* nothrow: NULL -> no surface */
     if (!s_fb)
         return;
     if (!hb_run_surface_blob())          /* LVGL/GL blob renders into s_fb, else: */
@@ -741,7 +860,8 @@ static void hb_install_custom_draw(void *view)
  * apps. Its draw callback (run between the GL view draw's begin-scene/end-scene) renders GL into
  * the view's own GPU pixel buffer on the GPU; the OS composites it into the view tree
  * (sub-rect, clipped, z-ordered) — GL embedded in an app view, not a fullscreen overlay. */
-#define GL_VTABLE_COPY_ADDR 0x09138000u   /* separate from the custom-draw view's copy */
+static uint32_t s_gl_vtable_copy[VTABLE_COPY_SIZE / 4u] __attribute__((aligned(8)));
+#define GL_VTABLE_COPY_ADDR ((uint32_t)(uintptr_t)s_gl_vtable_copy)  /* separate from the custom-draw view's copy */
 #define GLVIEW_CTX_OFF      0x260u        /* the GL view's context field                */
 
 static uint32_t s_gl_frame;
@@ -799,7 +919,6 @@ static void hb_install_gl_draw(void *view)
 
 /* The kind of the app currently presenting our screen — selects which view the
  * layer-creation hook injection adds (custom-draw LVGL surface vs a hardware-GL GL view). */
-static uint16_t s_cur_app_kind = HB_APP_KIND_CUSTOM_SCREEN;
 
 /* Inject our own view into a screen the OS PRESENTS, so the OS's layer
  * pass composites it natively (post-hoc injection onto an existing screen builds
@@ -811,7 +930,6 @@ static uint16_t s_cur_app_kind = HB_APP_KIND_CUSTOM_SCREEN;
 #define TEMPLATE_VTABLE    0x087ab73cu  /* Silver template view class vtable     */
 #define TEMPLATE_LAYERS_SLOT  0x168u       /* layer-creation hook slot offset      */
 #define TEMPLATE_LAYERS_ORIG  0x081e0a02u  /* composite view layer-creation hook   */
-#define INJECT_FLAG_ADDR   0x09135ff8u  /* one-shot: inject into the next present */
 #define A_ADDCHILD         0x0802dee8u  /* composite view's child-attach — own it */
 #define A_VIEW_PARENTSHOW  0x0847b274u  /* re-show the view under its parent on reuse */
 #define A_ZORDER_RAISE  0x080372b8u  /* raise the view to the front of its z-order           */
@@ -826,6 +944,7 @@ typedef void (*show1_t)(void *self, int on);
  * hardware-GL GL view — and on each launch re-show the one matching the launching
  * app's kind while hiding the other. So switching between an LVGL app and a GL app
  * on the shared canvas shows the right view, with no per-launch accumulation. */
+static uint8_t s_inject_armed;      /* one-shot: inject into the next present */
 static void *s_inject_lvgl_child;   /* custom-draw color / LVGL surface view */
 static void *s_inject_gl_child;     /* hardware-GL GL view           */
 static void *s_inject_canvas;
@@ -836,9 +955,8 @@ static void templ_hook(void *self, void *holder, int tt, int b)
     /* When armed (tt==enter key=0), inject our own view into the incoming screen's
      * canvas during the layer pass: the custom-draw surface (LVGL) or a real
      * GL view (GL), per the launching app's kind. */
-    uint8_t *inj = (uint8_t *)INJECT_FLAG_ADDR;
-    if (*inj && tt == 0) {
-        *inj = 0;
+    if (s_inject_armed && tt == 0) {
+        s_inject_armed = 0;
         void *canvas = hb_silver_template_canvas(self);
         hb_trace_log("TMPLCML ", (uint32_t)(uintptr_t)self, (uint32_t)(uintptr_t)canvas);
         if (canvas) {
@@ -904,140 +1022,335 @@ static void templ_hook(void *self, void *holder, int tt, int b)
  * Apps are no longer a hardcoded table: a staged .app PACK (HBPK) is parsed by
  * hb_app_register_pack, which registers every app's icon (one batched cache-table
  * extension), label, and home item, and fills g_launch[] with each app's launch
- * info. The tap router looks an app up by index and launches it by kind. Host
- * stages the pack at APP_PACK_ADDR; we copy it to the heap (stable — the icon
- * bitmaps it contains become cache entries) before registering. */
-#define APP_PACK_ADDR  0x09170000u
-#define APP_DISK_PATH  "/Apps/AllApps.pack"          /* installed app manifest on disk */
-#define APP_PACK_MAX   (1024u * 1024u)               /* pack = labels + shared screen (icons are disk-served) */
-#define HB_MAX_APPS    64   /* registrar arrays + pagination cap at 64 (6/page x 10 pages) */
-
+ * info. The tap router looks an app up by index and launches it by kind. The
+ * pack is read from disk into an exact-size heap block that stays allocated (the
+ * icon bitmaps it contains become cache entries). */
+#ifndef APP_DISK_PATH                                /* optional legacy catalog input */
+#define APP_DISK_PATH  "/Library/AllApps.pack"          /* installed app manifest on disk */
+#endif
+#define DEVCOLOR_PATH  "/Library/devcolor"      /* optional colour override index */
 static hb_app_launch_t g_launch[HB_MAX_APPS];
 static int             g_launch_count;
-static uint8_t         s_apps_loaded;     /* per-deploy: block 3 runs once per re-exec */
+static uint32_t        s_resident_version;
+static void           *s_live_pack, *s_retired_pack;
+static hb_app_files_t   s_files[HB_MAX_APPS], s_next_files[HB_MAX_APPS];
+static uint8_t         s_refreshing;
+static uint8_t         s_apps_loaded;     /* block 3 runs once */
+static void           *s_app_entry[HB_MAX_APPS];
+static void           *s_app_arena[HB_MAX_APPS];
+static uint32_t        s_app_code_len[HB_MAX_APPS];
+static uint32_t        s_app_fail_mask;
 
-/* Total byte length of a staged HBPK (max bundle offset + that bundle's len). */
-static uint32_t hb_pack_size(const uint8_t *pack)
+static void hb_app_executable_path(char path[96], const hb_app_launch_t *L,
+                                   const hb_app_files_t *files)
 {
-    uint32_t cnt = *(const uint32_t *)(pack + 8u);
-    const uint32_t *offs = (const uint32_t *)(pack + 12u);
-    uint32_t i, end = 0;
-    if (cnt == 0u || cnt > 64u)
-        return 0;
-    for (i = 0; i < cnt; i++) {
-        uint32_t blen = *(const uint32_t *)(pack + offs[i] + 44u);  /* bundle_len (hdr: +44 after name_off) */
-        if (offs[i] + blen > end)
-            end = offs[i] + blen;
-    }
-    return end;
+    int bundled = files->standalone;
+    const char *pre = bundled ? "/Apps/" : "/Apps/Executables/";
+    const char *suffix = bundled ? "/app.hbapp" : ".hbapp";
+    const char *name = bundled ? files->folder : L->name;
+    int i = 0, j;
+    for (j = 0; pre[j]; j++) path[i++] = pre[j];
+    for (j = 0; name[j]; j++) path[i++] = name[j];
+    for (j = 0; suffix[j]; j++) path[i++] = suffix[j];
+    path[i] = 0;
 }
 
-/* A relocatable .hbapp was just read into LV_SURFACE_VA. Returns 1 if it has a
- * valid reloc header (so reloc_load can run). We LOG the expected vs actual size
- * (APPNEED: a short read would mean a truncated install) but do NOT gate on it —
- * just let it try to run; the trace tells us if a launch ever misbehaves. `got` =
- * bytes hb_fs_read returned. */
-static int hb_blob_complete(uint32_t got)
+/* Load on first launch, retaining published bytes until unload/live refresh. */
+static int hb_ensure_app_executable(int slot, const hb_app_launch_t *L)
 {
-    const uint32_t *h = (const uint32_t *)LV_SURFACE_VA;   /* magic,entry,img,span,nrel,align */
-    if (got < 24u || h[0] != HB_RELOC_MAGIC)
+    char path[96];
+    if (s_app_entry[slot])
+        return 2;
+    hb_app_executable_path(path, L, &s_files[slot]);
+    if (hb_fs_size(path) != s_files[slot].executable_size)
         return 0;
-    hb_trace_log("APPNEED ", 24u + h[2] + 4u * h[4], got);  /* expected, got (log only) */
-    return 1;
+    s_app_entry[slot] = s_files[slot].standalone ?
+        hb_reloc_load_file_verified(path, &s_app_arena[slot], &s_app_code_len[slot],
+                                    s_files[slot].executable_hash) :
+        hb_reloc_load_file(path, &s_app_arena[slot], &s_app_code_len[slot], 0, 0);
+    hb_trace_log("APPLAZY ", (uint32_t)slot,
+                 (uint32_t)(uintptr_t)s_app_entry[slot]);
+    return s_app_entry[slot] ? 1 : 0;
+}
+
+/* ---- App executable lifetime -------------------------------------
+ * Launching an app first unloads every OTHER loaded app: its executable arena (code,
+ * data, bss) goes back to the OS heap, so two big games never sit in memory together.
+ * The catch: this task cannot invalidate the instruction cache (SVC #70 publishes the
+ * data cache only), and the next app may be loaded where the old one's code ran, so
+ * stale instruction lines could execute. Before entering code loaded after any unload,
+ * run a 512 KB straight-line sled: every L1 I-cache set (32 KB) is refilled ~64 times
+ * with sled lines, which evicts stale lines with overwhelming probability. The sled is
+ * allocated once, at the first launch after boot (memory no app code has used), and
+ * never changes or moves, so its own cached lines are always correct. */
+#define HB_SLED_BYTES (512u * 1024u)
+static uint32_t *s_sled;
+static uint8_t   s_sled_failed;
+static uint8_t   s_any_unloaded;
+
+static void hb_sled_init(void)
+{
+    uint32_t i, n = HB_SLED_BYTES / 4u;
+    if (s_sled || s_sled_failed)
+        return;
+    s_sled = (uint32_t *)hb_os_alloc(HB_SLED_BYTES + 32u);
+    if (!s_sled) {
+        s_sled_failed = 1;
+        hb_trace_log("SLEDFAIL", HB_SLED_BYTES, 0);
+        return;
+    }
+    s_sled = (uint32_t *)(((uintptr_t)s_sled + 31u) & ~(uintptr_t)31u);
+    for (i = 0; i + 1u < n; i++)
+        s_sled[i] = 0xE1A00000u;      /* ARM: mov r0, r0 */
+    s_sled[n - 1u] = 0xE12FFF1Eu;     /* ARM: bx lr       */
+    hb_icache_invalidate((uint32_t)(uintptr_t)s_sled, HB_SLED_BYTES);
+    hb_trace_log("SLEDINIT", (uint32_t)(uintptr_t)s_sled, HB_SLED_BYTES);
+}
+
+static void hb_icache_sweep(void)
+{
+    if (!s_sled)
+        return;
+    ((void (*)(void))(uintptr_t)s_sled)();   /* even address: BLX enters ARM state */
+    hb_trace_log("SWEEP   ", (uint32_t)(uintptr_t)s_sled, 0);
+}
+
+/* Free every loaded app except `keep` (the one being launched). */
+static void hb_unload_other_apps(int keep)
+{
+    int i;
+    if (!s_sled)
+        return;                         /* no sweep available: keep the old retain-all rule */
+    for (i = 0; i < g_launch_count; i++) {
+        if (i == keep || !s_app_arena[i])
+            continue;
+        if (s_surface_arena == s_app_arena[i]) {
+            s_surface_arena = 0;
+            s_surface_reloc_entry = 0;
+            s_surface_code = 0;
+            s_surface_frame = 0;
+            s_gl_frame_fn = 0;
+        }
+        hb_trace_log("UNLOAD  ", (uint32_t)i, (uint32_t)(uintptr_t)s_app_arena[i]);
+        hb_os_free(s_app_arena[i]);
+        s_app_arena[i] = 0;
+        s_app_entry[i] = 0;
+        s_app_code_len[i] = 0;
+        s_any_unloaded = 1;
+    }
 }
 
 /* Launch app record `L` from the home controller `self` (UI task). */
+__attribute__((used, noinline))
 static void hb_app_launch(void *self, const hb_app_launch_t *L)
 {
+    int slot = (int)(L - g_launch);
+    int load_state = 0;
+    if (slot < 0 || slot >= g_launch_count)
+        return;
+    if (s_refreshing) return;
+    hb_trace_log("LAUNCH  ", L->app_id, L->app_kind);
+    if (s_shared.prepare_unload && !s_shared.prepare_unload()) {
+        hb_trace_log("APPBUSY ", L->app_id, 0);
+        return; /* Never free audio-owned memory; a later tap retries the launch. */
+    }
+    s_shared.prepare_unload = 0;
     s_cur_app_kind = L->app_kind;     /* selects the injected view (templ_hook) */
+    hb_surface_drain_pending();
+    hb_free_app_aux();
+
+    if (L->app_kind == HB_APP_KIND_CUSTOM_SCREEN ||
+        L->app_kind == HB_APP_KIND_GL_SURFACE) {
+        hb_sled_init();                 /* first launch: before any app code exists */
+        hb_unload_other_apps(slot);
+        load_state = hb_ensure_app_executable(slot, L);
+        if (load_state == 1 && s_any_unloaded)
+            hb_icache_sweep();          /* new code may sit where freed code ran */
+        if (!load_state) {
+            if (slot < 32)
+                s_app_fail_mask |= 1u << slot;
+            hb_boot_report(BOOT_REPORT_FAILMASK_OFFSET, s_app_fail_mask);
+            hb_report_launch_memory(L->app_id, HB_LAUNCH_LOAD_FAILED);
+            return;
+        }
+        if (slot < 32)
+            s_app_fail_mask &= ~(1u << slot);
+        hb_boot_report(BOOT_REPORT_FAILMASK_OFFSET, s_app_fail_mask);
+        s_cur_exec_load_state = (uint8_t)load_state;
+    }
 
     if (L->app_kind == HB_APP_KIND_GL_SURFACE) {
-        /* GL app: load its relocatable .hbapp into an arena (like an LVGL surface
-         * app), call the entry to get the per-frame GL draw fn, and inject a
-         * fullscreen GL view the OS composites. Free the previous app's arena FIRST
-         * so relaunching/app-switching doesn't leak app code (and reset s_cur_app_id
-         * so a CUSTOM_SCREEN app launched next reloads instead of reusing the freed
-         * arena). The GL app blob is tiny (~3 KB) so we reload every launch. */
-        typedef void *(*gl_entry_t)(int op, void *fb, int w, int h);
-        char path[64];
-        const char *pre = "/Apps/Executables/";
-        int i = 0, j;
-        uint32_t len;
+        /* The GL executable was copied once during registration and is never
+         * rewritten or freed during this boot. Its entry resets per-launch state. */
         s_surface_frame = 0;
         s_gl_frame_fn = 0;
-        hb_surface_drain_pending();     /* reclaim the last quit's deferred arena */
-        if (s_surface_arena) {
-            ((opdelete_t)(ADDR_OP_DELETE | 1u))(s_surface_arena);
-            s_surface_arena = 0;
+        s_surface_arena = s_app_arena[slot];
+        s_cur_app_id = L->app_id;
+        hb_trace_log("GLAPPBIN", s_app_code_len[slot], (uint32_t)L->app_id);
+        if (s_app_entry[slot]) {
+            s_gl_frame_fn = (gl_frame_fn_t)(uintptr_t)
+                ((hb_surface_entry_t)s_app_entry[slot])(0, 0, FB_W, FB_H, &s_shared);
         }
-        s_cur_app_id = 0;
-        for (j = 0; pre[j]; j++) path[i++] = pre[j];
-        for (j = 0; j < 23 && L->name[j]; j++) path[i++] = L->name[j];
-        path[i++] = '.'; path[i++] = 'h'; path[i++] = 'b';
-        path[i++] = 'a'; path[i++] = 'p'; path[i++] = 'p'; path[i] = 0;
-        len = hb_fs_read(path, (void *)LV_SURFACE_VA, LV_SURFACE_MAX);
-        hb_trace_log("GLAPPBIN", len, (uint32_t)L->app_id);
-        if (hb_blob_complete(len)) {
-            void *entry = hb_reloc_load((const void *)LV_SURFACE_VA,
-                                        (void *(*)(uint32_t))(ADDR_OP_NEW | 1u),
-                                        &s_surface_arena);
-            if (entry)
-                s_gl_frame_fn = (gl_frame_fn_t)(uintptr_t)((gl_entry_t)entry)(0, 0, FB_W, FB_H);
-            hb_trace_log("GLAPPFN ", (uint32_t)(uintptr_t)s_gl_frame_fn, (uint32_t)L->app_id);
+        hb_trace_log("GLAPPFN ", (uint32_t)(uintptr_t)s_gl_frame_fn, (uint32_t)L->app_id);
+        if (s_gl_frame_fn) {
+            hb_boot_report(BOOT_REPORT_LAUNCH_OFFSET, 1);
+            hb_boot_report(BOOT_REPORT_APP_ID_OFFSET, L->app_id);
+            hb_boot_report(BOOT_REPORT_APP_KIND_OFFSET, L->app_kind);
+            hb_boot_report(BOOT_REPORT_ENTRY_OFFSET,
+                           (uint32_t)(uintptr_t)s_app_entry[slot]);
         }
-        *(uint8_t *)INJECT_FLAG_ADDR = 1;
+        hb_report_launch_memory(L->app_id,
+            s_gl_frame_fn
+                ? (load_state == 1 ? HB_LAUNCH_NEW_STARTED
+                                   : HB_LAUNCH_REUSED_STARTED)
+                : (load_state == 1 ? HB_LAUNCH_NEW_ENTRY_FAILED
+                                   : HB_LAUNCH_REUSED_ENTRY_FAILED));
+        s_inject_armed = 1;
+        hb_trace_log("PUSHSCR ", (uint32_t)L->screen_id, (uint32_t)L->layout_id);
         hb_silver_push_screen_id(self, L->screen_id, L->layout_id);
+        hb_trace_log("PUSHED  ", L->app_id, 0);
         return;
     }
 
     if (L->app_kind == HB_APP_KIND_CUSTOM_SCREEN) {
-        /* The app's relocatable blob lives on disk at /Apps/Executables/<bundle-name>.hbapp
-         * (kept out of the pack so the pack stays small). Read it into the surface
-         * slot when launching a DIFFERENT app, then re-init LVGL fresh. */
-        if (L->app_id != s_cur_app_id) {
-            char path[64];
-            const char *pre = "/Apps/Executables/";
-            int i = 0, j;
-            /* Switching apps: stop the timer from calling the old app's frame fn,
-             * then free the previous app's arena before allocating the next. */
-            s_surface_frame = 0;
-            hb_surface_drain_pending();  /* reclaim the last quit's deferred arena */
-            if (s_surface_arena) {
-                ((opdelete_t)(ADDR_OP_DELETE | 1u))(s_surface_arena);
-                s_surface_arena = 0;
-            }
-            for (j = 0; pre[j]; j++) path[i++] = pre[j];
-            for (j = 0; j < 23 && L->name[j]; j++) path[i++] = L->name[j];
-            path[i++] = '.'; path[i++] = 'h'; path[i++] = 'b';
-        path[i++] = 'a'; path[i++] = 'p'; path[i++] = 'p'; path[i] = 0;
-            /* Read the app into the staging slot. A relocatable .hbapp (magic
-             * 'HRL1') is loaded into an OS-heap arena and run from there (no fixed
-             * VA); a raw .bin keeps the legacy fixed-VA path. The staging read at
-             * LV_SURFACE_VA is transient — for a reloc app the code EXECUTES from
-             * the arena, not here. */
-            s_surface_code_len = hb_fs_read(path, (void *)LV_SURFACE_VA, LV_SURFACE_MAX);
-            hb_trace_log("APPBIN  ", s_surface_code_len, (uint32_t)L->app_id);
-            s_surface_reloc_entry = 0;
-            if (hb_blob_complete(s_surface_code_len)) {
-                s_surface_reloc_entry =
-                    hb_reloc_load((const void *)LV_SURFACE_VA,
-                                  (void *(*)(uint32_t))(ADDR_OP_NEW | 1u),
-                                  &s_surface_arena);
-                hb_trace_log("APPRELO ", (uint32_t)(uintptr_t)s_surface_reloc_entry,
-                             (uint32_t)L->app_id);
-                s_surface_code = s_surface_reloc_entry ? 1u : 0u;
-            } else {
-                s_surface_code = (s_surface_code_len >= 64u) ? LV_SURFACE_VA : 0;
-            }
-            s_cur_app_id = L->app_id;
-        }
+        /* Select the executable retained during registration; never reload it
+         * into a freed arena. The app entry reinitializes its BSS each launch. */
+        s_surface_frame = 0;
+        s_surface_arena = s_app_arena[slot];
+        s_surface_reloc_entry = s_app_entry[slot];
+        s_surface_code_len = s_app_code_len[slot];
+        s_surface_code = s_surface_reloc_entry ? 1u : 0u;
+        s_cur_app_id = L->app_id;
+        hb_trace_log("APPBIN  ", s_surface_code_len, (uint32_t)L->app_id);
+        hb_trace_log("APPRELO ", (uint32_t)(uintptr_t)s_surface_reloc_entry,
+                     (uint32_t)L->app_id);
         s_gfx_ready = 0;                /* hb_gfx_ensure re-runs the (new) app   */
         s_surface_frame = 0;
-        *(uint8_t *)INJECT_FLAG_ADDR = 1;            /* arm the custom-draw surface inject */
+        s_inject_armed = 1;            /* arm the custom-draw surface inject */
+        hb_trace_log("PUSHSCR ", (uint32_t)L->screen_id, (uint32_t)L->layout_id);
         hb_silver_push_screen_id(self, L->screen_id, L->layout_id);
+        hb_trace_log("PUSHED  ", L->app_id, 0);
     } else {
+        hb_trace_log("FIREHND ", L->app_id, (uint32_t)L->os_handler);
         hb_silver_fire_handler(self, L->os_handler, (void *)1);
     }
+}
+
+static int hb_same_bytes(const void *a, const void *b, uint32_t n)
+{
+    const uint8_t *p = a, *q = b;
+    while (n--) if (*p++ != *q++) return 0;
+    return 1;
+}
+
+static uint32_t hb_pack_size(const void *pack)
+{
+    const hb_app_pack_t *h = pack;
+    const uint32_t *off = (const uint32_t *)((const uint8_t *)pack + 12u);
+    if (!h->count) return 12u;
+    const hb_app_bundle_t *last = (const hb_app_bundle_t *)((const uint8_t *)pack + off[h->count - 1u]);
+    return off[h->count - 1u] + last->bundle_len;
+}
+
+/* Home's model refresh notification runs after USB eject/disconnect. A tap
+ * checks again before routing, so a missed notification never exposes stale code.
+ * All disk reads finish before Home/resource mutation. Nested callbacks are
+ * consumed while refreshing, including callbacks caused by yielding file I/O.
+ * Defer while an app is active or audio teardown is busy. Hide removed or
+ * incompatible apps through the stock Home model, update labels/icons and drop
+ * cached executables. Label nodes and icon extension are reused; retain at most
+ * the current and one retired catalog for queued UI teardown. App file changes
+ * need no reboot; replacing the resident itself still requires a restart. */
+static int hb_refresh_apps(int returning_home)
+{
+    void *next;
+    uint32_t i, j, count;
+    int changed;
+    if (s_refreshing || !s_apps_loaded || !hb_fs_is_dir("/iPod_Control")) return 0;
+    if (s_cur_app_id || (s_shared.prepare_unload && !s_shared.prepare_unload())) return 0;
+    s_refreshing = 1;
+    next = hb_app_catalog_load(APP_DISK_PATH, s_resident_version, s_next_files, hb_trace_log);
+    if (!next) { s_refreshing = 0; return 0; }
+    count = ((const hb_app_pack_t *)next)->count;
+    changed = !s_live_pack || hb_pack_size(next) != hb_pack_size(s_live_pack) ||
+        !hb_same_bytes(next, s_live_pack, hb_pack_size(next)) ||
+        !hb_same_bytes(s_files, s_next_files, count * sizeof(s_files[0]));
+    if (changed || returning_home) {
+        int loaded = 0;
+        for (i = 0; i < (uint32_t)g_launch_count; i++) if (s_app_arena[i]) loaded = 1;
+        if (loaded) {
+            hb_sled_init();
+            if (!s_sled) { hb_os_free(next); s_refreshing = 0; return 0; }
+            hb_surface_drain_pending();
+            hb_free_app_aux();
+        }
+        s_shared.prepare_unload = 0;
+        hb_unload_other_apps(-1);
+    }
+    if (!changed) {
+        if (returning_home) {
+            hb_silver_icon_refresh();
+            hb_silver_home_reload();
+        }
+        hb_os_free(next); s_refreshing = 0; return 1;
+    }
+    const uint32_t *off = (const uint32_t *)((const uint8_t *)next + 12u);
+    for (i = 0; i < (uint32_t)g_launch_count; i++) {
+        for (j = 0; j < count; j++) {
+            const hb_app_bundle_t *b = (const hb_app_bundle_t *)((const uint8_t *)next + off[j]);
+            const char *a = g_launch[i].sbid, *p = (const char *)b + b->sbid_off;
+            while (*a && *a == *p) { a++; p++; }
+            if (!*a && !*p) break;
+        }
+        if (j == count) hb_silver_home_hide_item(g_launch[i].sbid);
+    }
+    for (i = 0; i < count; i++) s_files[i] = s_next_files[i];
+    g_launch_count = hb_app_register_pack(next, hb_os_alloc, hb_trace_log,
+        g_launch, HB_MAX_APPS, SILVERDB_OBJ, SILVERDB_NODE,
+        hb_silver_icon_live() ? 2 : 1, s_files);
+    /* Resource objects now reference next. Retain one previous catalog through
+     * the following Home cycle as well, so queued cell teardown can finish. */
+    if (s_retired_pack) hb_os_free(s_retired_pack);
+    s_retired_pack = s_live_pack;
+    s_live_pack = next;
+    s_app_fail_mask = 0;
+    hb_boot_report(BOOT_REPORT_FAILMASK_OFFSET, 0);
+    hb_boot_report(BOOT_REPORT_APP_COUNT_OFFSET, (uint32_t)g_launch_count);
+    hb_trace_log("APPREF  ", (uint32_t)g_launch_count, 0);
+    s_refreshing = 0;
+    return 1;
+}
+
+/* Let the USB/navigation message finish, including cached-view teardown,
+ * before rebuilding Home. A one-shot timer posts back to the Home controller's
+ * UI message queue; no UI mutation runs on the timer/USB task. */
+static uint8_t s_refresh_timer[128] __attribute__((aligned(8)));
+static uint8_t s_refresh_timer_initialized, s_refresh_pending;
+
+static void hb_schedule_app_refresh(void *self)
+{
+    if (s_refresh_pending) return;
+    s_refresh_pending = 1;
+    if (!s_refresh_timer_initialized) {
+        ((timer_ctor_t)(A_TIMER_CTOR | 1u))(s_refresh_timer, self, 0, 0);
+        s_refresh_timer_initialized = 1;
+    }
+    ((timer_set_t)(A_TIMER_SET | 1u))(s_refresh_timer, (long long)500);
+    ((timer1_t)(A_TIMER_START | 1u))(s_refresh_timer);
+}
+
+__attribute__((section(".text.hook"), used, noinline))
+static int hb_home_message_hook(void *self, void *msg)
+{
+    if (msg && *(uint32_t *)((char *)msg + MSG_FTYPE_OFF) == CLTIMERMSG &&
+        *(void **)((char *)msg + 8u) == (void *)s_refresh_timer) {
+        if (s_refresh_pending) {
+            s_refresh_pending = 0;
+            hb_refresh_apps(1);
+        }
+        return 1;
+    }
+    return ((msg_fn_t)HB_SILVER_HOME_MESSAGE_ORIG)(self, msg);
 }
 
 /* RAW-MESSAGE slot (+0x188): taps arrive here. Translate the message EXACTLY
@@ -1048,8 +1361,16 @@ __attribute__((section(".text.hook"), used, noinline))
 static int rawmsg_hook(void *self, void *msg)
 {
     char ev[64];
+    int refresh_home = 0;
+    /* Snapshot before forwarding: stock handlers can release message payloads.
+     * USB return rebuilds Home via model notifications, not a Main action. */
+    if (msg && *(uint32_t *)((char *)msg + MSG_FTYPE_OFF) == 30u) {
+        const uint32_t *payload = *(const uint32_t **)((char *)msg + 8u);
+        refresh_home = payload && payload[1] == HB_SILVER_HOME_REFRESH_NOTICE;
+    }
     int r = hb_silver_rawmsg(self, msg, "sbitem.hb.", ".clicked", ev, sizeof ev);
     if (r == HB_SILVER_RAWMSG_CLAIMED) {
+        if (!hb_refresh_apps(0)) return 1;
         /* ev = "sbitem.<sbid>.clicked"; sbid ("hb.<folder>") begins after "sbitem."
          * (7 chars) and runs to ".clicked". Match it against the registry by sbid
          * STRING (never a numeric index) — an app keeps its identity + home-screen
@@ -1068,6 +1389,9 @@ static int rawmsg_hook(void *self, void *msg)
         }
         return 1;                            /* our app handled the tap */
     }
+    /* Queue after stock notification handling; cached native views may still
+     * be completing the USB transition when this inner handler returns. */
+    if (refresh_home) hb_schedule_app_refresh(self);
     return r;
 }
 
@@ -1075,195 +1399,202 @@ static int rawmsg_hook(void *self, void *msg)
 __attribute__((section(".text.hook"), used, noinline))
 static int action_hook(void *self, const char *name, void *msg)
 {
-    /* (2) Per-deploy: keep resource-getter pointed at THIS build's hook (full patch on
-     * a fresh boot; re-aim on a re-push, the trampoline persists). Resident code
-     * moves between builds, so this must refresh each deploy; FLAG_ADDR cleared at
-     * entry. (Icon registration is per-BOOT, in block (3): it mutates the global
-     * bitmap-cache table, which must not be re-extended on a bare re-push.) */
-    uint8_t *icon_flag = (uint8_t *)FLAG_ADDR;
-    if (*icon_flag == 0) {
-        *icon_flag = 1;
-        if (*(uint16_t *)(uintptr_t)ADDR_GETRESOURCE == GETRES_PROLOGUE0)
-            hb_silver_patch_function(ADDR_GETRESOURCE, (void *)&getres_hook,
-                                     (void *)GETRES_TRAMP_ADDR);
-        else
-            hb_silver_repoint_function(ADDR_GETRESOURCE, (void *)&getres_hook);
+    /* (2) Once per boot: build every forwarding trampoline (in our .bss) from
+     * the verified 39A10023 stock prologue, then point the firmware entry at our
+     * hook. Always from the stock bytes, so a firmware entry a previous boot
+     * left patched in DRAM is simply overwritten. */
+    if (!s_hooks_patched) {
+        s_hooks_patched = 1;
+        int bt_fix = hb_bluetooth_fix();
+        int dock_fix = hb_dock_fix();
+        hb_trace_log("BTFIX   ", (uint32_t)bt_fix, 0);
+        hb_trace_log("DOCKFIX ", (uint32_t)dock_fix, 0);
+        hb_boot_report(0x154u, (uint32_t)bt_fix);
+        hb_boot_report(0x158u, (uint32_t)dock_fix);
+        hb_silver_patch_function_stock(ADDR_GETRESOURCE, (void *)&getres_hook,
+                                       s_getres_tramp,
+                                       GETRES_STOCK, sizeof GETRES_STOCK);
         hb_trace_log("GRPATCH ", *(uint32_t *)(uintptr_t)ADDR_GETRESOURCE, 0);
 
+        hb_silver_patch_function_stock(ADDR_POSTTOUCH, (void *)&hb_posttouch_hook,
+                                       s_posttouch_tramp,
+                                       POSTTOUCH_STOCK, sizeof POSTTOUCH_STOCK);
+        hb_trace_log("PTPATCH ", *(uint32_t *)(uintptr_t)ADDR_POSTTOUCH, 0);
+
         /* Re-aim Home-triple-click at our screenshot hook. We never forward through
-         * a trampoline (we reimplement the original), so a plain repoint each deploy
-         * is correct whether the entry is pristine or already redirected. */
+         * a trampoline (we reimplement the original), so a plain repoint is
+         * correct whether the entry is pristine or already redirected. */
         hb_silver_repoint_function(A_HOME_TRIPLE, (void *)&hb_home_triple_hook);
         hb_trace_log("SHOTPCH ", *(uint32_t *)(uintptr_t)A_HOME_TRIPLE, 0);
 
-        /* demo status-bar 9:41 clock: patch the locale short-time formatter
-         * (0x084a9adc) with a 4-byte B.W — its prologue has a PC-relative op within
-         * the first 10 bytes, so the 10-byte trampoline jump won't fit. */
-        if (*(uint16_t *)(uintptr_t)A_DTTS == DTTS_PROLOGUE)
-            hb_silver_patch_function_bw(A_DTTS, (void *)&hb_dtts_hook,
-                                        (void *)DTTS_TRAMP_ADDR, 4);
-        else
-            hb_silver_repoint_function_bw(A_DTTS, (void *)&hb_dtts_hook);
+        /* All demo-bar hooks use absolute jumps: resident allocations can be
+         * more than 16 MiB from firmware. Relocate the clock's PC-relative
+         * literal explicitly; its original value remains the firmware's. */
+        for (unsigned i = 0; i < sizeof DTTS_RELOCATED; i++)
+            s_dtts_tramp[i] = DTTS_RELOCATED[i];
+        *(uint32_t *)(s_dtts_tramp + 16) = *(const uint32_t *)DTTS_LITERAL;
+        hb_silver_repoint_function_abs((uint32_t)(uintptr_t)(s_dtts_tramp + 8),
+                                       (void *)(uintptr_t)(A_DTTS + 8));
+        hb_icache_invalidate((uint32_t)(uintptr_t)s_dtts_tramp, 20);
+        hb_silver_repoint_function_abs(A_DTTS, (void *)&hb_dtts_hook);
         hb_trace_log("DTTSPCH ", *(uint32_t *)(uintptr_t)A_DTTS, 0);
 
-        /* demo status-bar 100% battery (not charging): both index getters via B.W */
-        if (*(uint16_t *)(uintptr_t)A_BATT_LEVEL == BATT_PROLOGUE)
-            hb_silver_patch_function_bw(A_BATT_LEVEL, (void *)&hb_batt_level_hook,
-                                        (void *)BATT_LEVEL_TRAMP, 4);
-        else
-            hb_silver_repoint_function_bw(A_BATT_LEVEL, (void *)&hb_batt_level_hook);
-        if (*(uint16_t *)(uintptr_t)A_BATT_STATUS == BATT_PROLOGUE)
-            hb_silver_patch_function_bw(A_BATT_STATUS, (void *)&hb_batt_status_hook,
-                                        (void *)BATT_STATUS_TRAMP, 4);
-        else
-            hb_silver_repoint_function_bw(A_BATT_STATUS, (void *)&hb_batt_status_hook);
+        hb_silver_patch_function_abs_stock(A_BATT_LEVEL, (void *)&hb_batt_level_hook,
+                                           s_batt_level_tramp,
+                                           BATT_LEVEL_STOCK, sizeof BATT_LEVEL_STOCK);
+        hb_silver_patch_function_abs_stock(A_BATT_STATUS, (void *)&hb_batt_status_hook,
+                                           s_batt_status_tramp,
+                                           BATT_STATUS_STOCK, sizeof BATT_STATUS_STOCK);
         hb_trace_log("BATTPCH ", *(uint32_t *)(uintptr_t)A_BATT_LEVEL,
                                  *(uint32_t *)(uintptr_t)A_BATT_STATUS);
 
 #if HB_REC_INTERCEPT
         hb_rec_install();       /* singleton-controller message handler filter for the capture timer */
 #endif
+
+        /* File I/O yields to other tasks, so it must not run until the firmware
+         * entries above point at this image. */
+        save_last_trace();
     }
 
-    /* (3) Per-boot (gated on real OS chain state): publish the (shared) label
-     * blob, then register every app from the staged .app PACK. We copy the pack
-     * to the heap first so the icon bitmaps it contains (which become bitmap-cache
-     * entries) live in stable memory. The registrar does the batched icon
-     * cache-table extension, adds the home items, and fills g_launch[]. */
+    /* (3) Once per boot: register every app from the on-disk .app PACK. The pack
+     * is read into an exact-size heap block that stays allocated (the icon bitmaps
+     * it contains become bitmap-cache entries). The registrar does the batched
+     * icon cache-table extension, adds the home items, and fills g_launch[]. */
     if (!s_apps_loaded) {
-        s_apps_loaded = 1;                 /* once per DEPLOY (.bss, zeroed at entry) */
+        hb_trace_log("APPLOAD ", 0, 0);
+        s_apps_loaded = 1;
+        s_refreshing = 1; /* registration may yield to a nested USB notice */
+
+        /* Read the optional colour override before publishing Home items.
+         * hb_silver_home_reload may render disk-backed icons immediately, and
+         * those reads share hb_fs's deliberately single-operation cache. */
+        char dc[4] = {0};
+        int dc_idx = -1;
+        if (hb_fs_read(DEVCOLOR_PATH, dc, sizeof dc - 1) > 0 &&
+            dc[0] >= '0' && dc[0] <= '9') {
+            dc_idx = dc[0] - '0';
+            if (dc[1] >= '0' && dc[1] <= '9')
+                dc_idx = dc_idx * 10 + (dc[1] - '0');
+        }
+
         /* OS-mutating registration (icon table extension, labels, screen, home
-         * items) runs only once per BOOT — gated on whether our bitmap-cache
-         * entries are still LIVE (hb_silver_icon_live). That is robust across a
-         * no-reboot re-push (entries persist -> reg=0, skip OS mutation) AND a
-         * reboot (cache reset -> reg=1, re-register). We do NOT gate on the 'HBap'
-         * label tag here: the OS can drop it across a re-push while our entries
-         * persist, which would wrongly RE-extend the cache (double-registration) and
-         * leave the home items pointing at the wrong icon ids. The tap table
-         * g_launch[] is re-filled EVERY deploy so a re-push works without a reboot. */
+         * items) is gated on whether our bitmap-cache entries are already LIVE
+         * (hb_silver_icon_live): never extend the cache twice. The untethered
+         * loader runs us once per boot, when the cache has just been reset. */
         int reg = !hb_silver_icon_live();
-        /* Install the event-path touch capture once per boot (patch is RAM, gone
-         * after a reboot; reg tracks per-boot OS state). Only patch if unpatched. */
-        if (reg && *(uint16_t *)(uintptr_t)ADDR_POSTTOUCH == POSTTOUCH_PROLOGUE) {
-            /* 12-byte prologue (a ldr.w spans bytes 8-11), not the default 10 */
-            hb_silver_patch_function_n(ADDR_POSTTOUCH, (void *)&hb_posttouch_hook,
-                                       (void *)POSTTOUCH_TRAMP, 12);
-            hb_trace_log("PTPATCH ", *(uint32_t *)(uintptr_t)ADDR_POSTTOUCH, 0);
-        }
-        /* Pack source: prefer the on-DISK pack (apps are real installed files;
-         * the host writes it straight to /Apps via the device-host mount). Only
-         * fall back to a DRAM-staged pack if disk has none — staging 280 KB into
-         * live OS DRAM at 0x09170000 corrupts the running compositor and white-
-         * screens, so disk is the safe default path. (hb_fs is proven safe.) */
-        const uint8_t *staged = (const uint8_t *)APP_PACK_ADDR;
-        const void *pack = 0;
-        uint32_t psz = 0, src = 0;
-        uint8_t *hp = (uint8_t *)((opnew_t)(ADDR_OP_NEW | 1u))(APP_PACK_MAX);
-        if (hp) {
-            uint32_t n = hb_fs_read(APP_DISK_PATH, hp, APP_PACK_MAX);
-            if (n >= 16u && *(const uint32_t *)hp == HB_APP_PACK_MAGIC) {
-                pack = hp; psz = n; src = 2;              /* 2 = read from disk */
-            }
-        }
-        if (!pack && *(const uint32_t *)staged == HB_APP_PACK_MAGIC) {
-            psz = hb_pack_size(staged);
-            uint8_t *dp = psz ? (uint8_t *)((opnew_t)(ADDR_OP_NEW | 1u))(psz) : 0;
-            if (dp) {
-                for (uint32_t i = 0; i < psz; i++)
-                    dp[i] = staged[i];
-                pack = dp; src = 1;                       /* 1 = DRAM-staged */
-                hb_fs_write(APP_DISK_PATH, dp, psz);      /* install to disk */
-            }
-        }
-        hb_trace_log("APPSRC  ", src, psz);
+        /* Merge independent disk manifests before the single batched registrar
+         * call. No shared catalog rewrite is needed to install a prebuilt app. */
+        const void *pack = hb_app_catalog_load(APP_DISK_PATH, s_resident_version, s_files, hb_trace_log);
+        s_live_pack = (void *)pack;
         if (pack)
-        g_launch_count = hb_app_register_pack(pack,
-                            (void *(*)(uint32_t))(ADDR_OP_NEW | 1u),
-                            (void (*)(const char *, uint32_t, uint32_t))&hb_trace_log,
-                            g_launch, HB_MAX_APPS,
-                            (void *)SILVERDB_OBJ, (void *)SILVERDB_NODE, reg);
+            g_launch_count = hb_app_register_pack(pack,
+                                hb_os_alloc,    /* nothrow; every callee NULL-checks */
+                                (void (*)(const char *, uint32_t, uint32_t))&hb_trace_log,
+                                g_launch, HB_MAX_APPS,
+                                SILVERDB_OBJ, SILVERDB_NODE, reg, s_files);
         hb_trace_log("APPSREG ", (uint32_t)g_launch_count, (uint32_t)reg);
+        hb_boot_report(BOOT_REPORT_REGISTER_OFFSET, 1);
+        hb_boot_report(BOOT_REPORT_APP_COUNT_OFFSET,
+                       (uint32_t)g_launch_count);
+        hb_boot_report(BOOT_REPORT_PRELOAD_OFFSET, 0);
+        hb_boot_report(BOOT_REPORT_FAILMASK_OFFSET, 0);
+        hb_boot_report(BOOT_REPORT_HEAP_BOOT_FREE_OFFSET,
+                       hb_os_heap_free());
+        hb_boot_report(BOOT_REPORT_HEAP_BOOT_LARGEST_OFFSET,
+                       hb_os_heap_largest());
+
+        /* Optional device-colour override: /Library/devcolor holds an index
+         * (0 = Space Gray .. 11). RAM only, re-applied each boot; delete the file
+         * to go back to the factory colour. */
+        if (dc_idx >= 0 && dc_idx < hb_devcolor_count())
+            hb_devcolor_set(dc_idx);
+        if (dc_idx >= 0)
+            hb_trace_log("DEVCOLOR", (uint32_t)dc_idx,
+                         (uint32_t)hb_devcolor_get());
+        s_refreshing = 0;
+    } else if (name) {
+        const char *p = name, *want = "HandleGotoMainScreen";
+        while (*want && *want == *p) { want++; p++; }
+        if (!*want && !*p) hb_schedule_app_refresh(self);
+    }
+    if (name) {
+        const char *p = name, *want = "NanoAppsInitialize";
+        while (*want && *want == *p) { want++; p++; }
+        if (!*want && !*p) return 1;
     }
     return ((dispatch_t)HB_SILVER_HOME_DISPATCH_ORIG)(self, name, msg);
 }
 
-HB_APP_ENTRY(payload_entry)
+/* Entry, called once per boot by the heap bootstrap after it has loaded,
+ * rebased and zeroed this image. Installs the home-controller hooks; the
+ * bootstrap checks they point into this allocation before handing over. */
+__attribute__((section(".text.entry"), used, noinline))
+void payload_entry(void *image_base, uint32_t image_span, uint32_t resident_version)
 {
-    hb_trace_reset();
-    hb_trace_log("RESIDENT", 0x09130000u, 0);
+    const void *prev;
+    uint32_t seq;
+    int same_boot;
 
-    /* Reboot-free iteration: ALWAYS (re)install the hooks with THIS build's
-     * addresses, so a plain re-push takes effect without a power-cycle.
-     * Forwarding uses the hardcoded stock originals, so re-hooking over our own
-     * hook is safe. Clear the per-deploy icon-serve guard so action_hook
-     * refreshes the resolver pointer to this build. App (re)registration is
-     * gated separately on real OS chain state (hb_silver_resdb_has_tag), which
-     * is correct across both a re-push and a (DRAM-preserving) panic-reboot. */
-    *(uint8_t *)FLAG_ADDR = 0;
-    *(uint8_t *)SCREENSHOT_FLAG_ADDR = 1;  /* default Screenshot; the app sets mode 0/1/2 */
-    *(uint8_t *)STATUSBAR_FLAG_ADDR = 0;   /* battery-100% override off by default        */
-    /* Icon resolver across a no-reboot re-push: if the apps are already registered
-     * (OS chain tag present, so action_hook will SKIP re-registration), re-arm the
-     * lazy resolver to THIS build's function from the persisted state — otherwise a
-     * re-push leaves the resolver pointing at the previous (overwritten) build and
-     * every home icon renders blank, killing the artwork-based tap regions. On a
-     * fresh boot (tag absent) registration installs it, so just clear any stale
-     * pointer here. */
-    /* Icon resolver across a no-reboot re-push: re-arm it whenever our cache
-     * entries are STILL LIVE (robust check — NOT the OS label tag, which the OS
-     * drops across a re-push and would make us wrongly clear the resolver and
-     * blank every homebrew icon). If the cache was reset by a reboot, clear any
-     * stale pointer; the re-registration below re-installs it. */
-    if (hb_silver_icon_live())
+    s_resident_version = resident_version;
+
+    hb_boot_report(BOOT_REPORT_RESIDENT_OFFSET, 1);
+    hb_boot_report(0x15cu, resident_version);
+    hb_boot_report(0x160u, HB_APP_MANIFEST_ABI);
+    hb_boot_report(0x16cu, 0x4c495645u); /* LIVE: app-only installs need no restart */
+    s_shared.magic   = HB_SHARED_MAGIC;
+    s_shared.version = HB_SHARED_VERSION;
+    s_shared.trace   = hb_trace_log;
+    s_shared.screenshot_mode = 1;      /* default Screenshot; the app sets mode 0/1/2 */
+    hb_shared = &s_shared;
+
+    /* Find the previous boot's ring (DRAM survives a panic reboot) before our
+     * own ring is stamped; action_hook writes the copy to disk. */
+    /* The prior-ring scan covers ordinary heap, including the address where
+     * this image may have just landed. Exclude this allocator-owned block so
+     * code/data bytes can never be misidentified as a surviving old ring. */
+    if ((uintptr_t)image_base > (uintptr_t)&payload_entry ||
+        image_span > 0x100000u ||
+        (uintptr_t)&payload_entry - (uintptr_t)image_base >= image_span) {
+        image_base = 0;
+        image_span = 0;
+    }
+    prev = hb_trace_find_previous(&seq, image_base, image_span);
+    if (prev) {
+        const uint32_t *src = (const uint32_t *)prev;
+        for (uint32_t i = 0; i < HB_TRACE_BYTES / 4u; i++)
+            s_prev_ring[i] = src[i];
+        s_prev_found = 1;
+    }
+    hb_trace_attach(s_trace_ring, seq + 1u);
+    hb_boot_report(0x150u, (uint32_t)(uintptr_t)s_trace_ring);
+    hb_trace_log("RESENTRY", (uint32_t)(uintptr_t)&payload_entry, seq + 1u);
+    hb_trace_log("PREVRING", (uint32_t)(uintptr_t)prev, seq);
+    hb_silver_rawmsg_trace = hb_trace_log;
+
+    /* Our bitmap-cache entries can only be live if this image ran before in
+     * this boot (not expected: the loader runs us once). If the cache was reset
+     * by a reboot, clear any stale resolver pointer; registration re-installs it. */
+    same_boot = hb_silver_icon_live();
+    hb_trace_log("BOOTLIVE", (uint32_t)same_boot, 0);
+    if (same_boot)
         hb_silver_icon_rearm();
     else
         hb_silver_icon_reset_resolver();
-        /* stop a heartbeat timer left armed by a previous deploy — its callback now
-     * points into overwritten resident code.
-     *
-     * Only if that deploy was in THIS boot. The magic and the OS timer object live
-     * in resident DRAM, which survives a DRAM-preserving reboot (a force restart,
-     * or a panic) — e.g. when the iPod restarts while an app is on screen, before
-     * hb_surface_stop_timer runs. The OS event server the timer was registered with
-     * does NOT survive: the object's links point into the previous boot's state, and
-     * A_TIMER_STOP on it never returns. This entry runs inside the SCSI exec, so the
-     * whole USB interface then hangs (the host resets the device every 10-30 s) and,
-     * since the magic survives every further force restart, every later deploy hangs
-     * the same way until DRAM is cleared.
-     *
-     * Same boot <=> our home dispatch hook is still installed: the OS image (and the
-     * vtable we patch) is reloaded on every boot, cold or DRAM-preserving — the same
-     * fact action_hook relies on for "full patch on a fresh boot" (GETRES_PROLOGUE0).
-     * Read it BEFORE re-hooking below. A stale timer is just forgotten. */
-    {
-        uint32_t disp = *(uint32_t *)(uintptr_t)(HB_SILVER_HOME_VTABLE + HB_SILVER_HOME_DISPATCH_SLOT);
-        int same_boot = disp >= 0x09130000u && disp < 0x09140000u;
-        if (*(uint32_t *)TIMER_MAGIC_ADDR == TIMER_MAGIC) {
-            if (same_boot)
-                ((timer1_t)(A_TIMER_STOP | 1u))((void *)TIMER_ADDR);
-            *(uint32_t *)TIMER_MAGIC_ADDR = 0;
-            hb_trace_log("TIMRCLR ", (uint32_t)same_boot, disp);
-        }
-    }
-    /* s_gfx_ready / s_fb live in .bss (zeroed at entry), so the custom-draw surface is
-     * rebuilt — and the framebuffer re-allocated from the heap — this deploy. */
+    /* Zeroed, heap-owned timer state never refers to an OS timer from a previous boot. */
 
+    hb_silver_uitask_hook(HB_SILVER_HOME_VTABLE, HB_SILVER_HOME_MESSAGE_SLOT, (void *)&hb_home_message_hook);
     uint32_t p1 = hb_silver_uitask_hook(HB_SILVER_HOME_VTABLE,
                                         HB_SILVER_HOME_RAWMSG_SLOT, (void *)&rawmsg_hook);
     uint32_t p2 = hb_silver_uitask_hook(HB_SILVER_HOME_VTABLE,
                                         HB_SILVER_HOME_DISPATCH_SLOT, (void *)&action_hook);
-    /* Hook the template view's layer-creation hook slot (forwards to
-     * the hardcoded original, so re-hooking over our own hook is safe). */
-    *(uint8_t *)INJECT_FLAG_ADDR = 0;
+    /* Hook the template view's layer-creation hook slot (forwards to the
+     * hardcoded original). */
     uint32_t p3 = hb_silver_uitask_hook(TEMPLATE_VTABLE, TEMPLATE_LAYERS_SLOT,
                                         (void *)&templ_hook);
     hb_trace_log("ARMED   ", p1, p2);
     hb_trace_log("ARMEDCML", p3, 0);
 
-    /* Re-aim the singleton-controller message handler filter HERE (at exec), not lazily in
-     * action_hook: after a re-deploy the patched slot points at the PREVIOUS build's
-     * hook (now-overwritten code), and the OS sends the singleton messages
-     * constantly — waiting for the first tap to re-aim would crash in that window. */
 #if HB_REC_INTERCEPT
     hb_rec_install();
 #endif

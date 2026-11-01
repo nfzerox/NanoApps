@@ -14,11 +14,11 @@
 #include "lvgl/lvgl.h"
 
 /* ---- events ----
-   Stored as YYYY-MM-DD<TAB>text<NL> in /Apps/Data/Calendar/events.txt.
+   Stored as YYYY-MM-DD<TAB>text<NL> in /Data/Calendar/events.txt.
    Loaded once at startup; saved on add/delete. */
 
-#define EVENTS_PATH    "/Apps/Data/Calendar/events.txt"
-#define EVENTS_DIR     "/Apps/Data/Calendar"
+#define EVENTS_PATH    "/Data/Calendar/events.txt"
+#define EVENTS_DIR     "/Data/Calendar"
 #define MAX_EVENTS     128
 #define MAX_EVENT_TEXT 64
 
@@ -795,7 +795,7 @@ static void on_today(lv_event_t *e)
 
 HB_APP_ENTRY(payload_entry)
 {
-    hb_fs_mkdir("/Apps/Data");
+    hb_fs_mkdir("/Data");
     hb_fs_mkdir(EVENTS_DIR);
     load_events();
 

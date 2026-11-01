@@ -1,0 +1,6 @@
+[build]
+target = "thumbv6m-none-eabi"
+
+[target.thumbv6m-none-eabi]
+linker = "arm-none-eabi-gcc"
+ar = "arm-none-eabi-ar"

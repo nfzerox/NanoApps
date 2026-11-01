@@ -11,7 +11,7 @@
  *
  * Each row supports iOS-style swipe-to-reveal delete.
  *
- * Storage: /Apps/Data/Reminders/items.txt — one line per item,
+ * Storage: /Data/Reminders/items.txt — one line per item,
  * format "<status>\t<text>\n" where status is '0' (pending) or '1'
  * (done). Atomic full-file rewrite on every change.
  */
@@ -24,7 +24,7 @@
 #define MAX_ITEMS    128
 #define MAX_TEXT     128
 #define FILE_BUF_SZ  (MAX_ITEMS * (MAX_TEXT + 4))
-#define DATA_DIR     "/Apps/Data/Reminders"
+#define DATA_DIR     "/Data/Reminders"
 #define MAX_LISTS    16
 #define LIST_LEN     32
 
@@ -458,7 +458,7 @@ HB_APP_ENTRY(payload_entry)
 {
     hb_trace_init();
 
-    hb_fs_mkdir("/Apps/Data");
+    hb_fs_mkdir("/Data");
     hb_fs_mkdir(DATA_DIR);
     load_pref();
     load_items();

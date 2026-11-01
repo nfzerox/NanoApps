@@ -26,16 +26,11 @@ typedef void (*bump_ref_t)(void *buf);
 #define ICON_BUF_SZ   (56u * 1024u)       /* >= a 112x112 ARGB bitmap header     */
 #define ICON_DISK_DIR "/Apps/Icons/"
 
-/* Lazy-resolver state lives at a FIXED, reboot-stable DRAM address — NOT in the
- * resident's .bss, which is zeroed on every (re)deploy. The resident code (and
- * thus the resolver function) moves between builds, but this state (which ids we
- * serve, the LRU of OS-heap buffers the previous deploy allocated) must survive a
- * no-reboot re-push so the resolver can simply be re-armed to the new build's
- * function. The bitmap-cache TABLE is only extended once per BOOT (gated on real
- * OS chain state); the resolver POINTER + this state are re-established every
- * deploy via hb_silver_icon_rearm(). Address 0x09135b00 is free scratch (NODE is
- * 16 B at ...a00; the heartbeat timer is at ...c00). */
-#define ICON_STATE_ADDR  0x09135b00u
+/* Lazy-resolver state: which ids we serve and the LRU of OS-heap buffers. It
+ * lives in the resident's .bss (inside its heap-loaded image). It used to sit
+ * at fixed 0x09135b00 so it could survive a no-reboot SCSI re-push, but that
+ * address is live OS heap, and the untethered loader runs the resident exactly
+ * once per boot, so there is no re-push to survive. */
 #define ICON_STATE_MAGIC 0x49434e53u      /* 'ICNS' — state established + valid   */
 
 typedef struct {
@@ -44,19 +39,24 @@ typedef struct {
     long     first;                       /* first cache id of our icons          */
     int      count;                       /* number of lazily-served icons        */
     uint32_t rr;                          /* round-robin eviction cursor          */
-    uint32_t names;                       /* heap char[count][24]: bundle name per icon */
+    uint32_t names;                       /* heap char[count][64]: folder/legacy name */
+    uint32_t hashes[64];                  /* zero = legacy icon; otherwise manifest FNV */
+    uint8_t bundled[64];                  /* /Apps/<folder>/icon.bin instead of legacy */
     struct { long id; uint8_t *buf; } lru[ICON_LRU_N];
 } icon_state_t;
 
-#define ICON_NAME_MAX 24u                 /* per-icon bundle-name buffer         */
+#define ICON_NAME_MAX 64u                 /* folder, or legacy filename          */
 
-#define IST  ((volatile icon_state_t *)(uintptr_t)ICON_STATE_ADDR)
+static icon_state_t s_icon_state;
+#define IST  ((volatile icon_state_t *)&s_icon_state)
 
-/* Build ICON_DISK_DIR "<bundle-name>.bin" into `out` for the k-th icon. If no
- * name table was registered (or this slot is blank), fall back to "<k>.bin". */
+/* Bundles keep icons beside their code. Legacy catalogs use Icons/<name>.bin;
+ * blank legacy slots fall back to Icons/<k>.bin. */
 static void icon_path(char *out, long k)
 {
-    const char *d = ICON_DISK_DIR;
+    int bundled = k >= 0 && k < 64 && IST->bundled[k];
+    const char *d = bundled ? "/Apps/" : ICON_DISK_DIR;
+    const char *suffix = bundled ? "/icon.bin" : ".bin";
     const char *nm = 0;
     int i = 0, t;
 
@@ -73,14 +73,15 @@ static void icon_path(char *out, long k)
         else { long v = k; while (v) { num[s++] = (char)('0' + v % 10); v /= 10; } }
         for (t = s - 1; t >= 0; t--) out[i++] = num[t];
     }
-    out[i++] = '.'; out[i++] = 'b'; out[i++] = 'i'; out[i++] = 'n'; out[i] = 0;
+    while (*suffix) out[i++] = *suffix++;
+    out[i] = 0;
 }
 
 __attribute__((section(".text.hook"), used, noinline))
 static long icon_lazy_resolver(long id, void *out_ptr)
 {
     long k = id - IST->first;
-    char path[48];
+    char path[96];
     uint8_t *buf;
     uint32_t slot, n;
     int i;
@@ -102,6 +103,11 @@ static long icon_lazy_resolver(long id, void *out_ptr)
         return ((alt_resolver_t)(uintptr_t)ORIG_ALT_RESOLVER)(id, out_ptr);
     icon_path(path, k);
     n = hb_fs_read(path, buf, ICON_BUF_SZ);
+    if (n >= 28u && IST->hashes[k]) {
+        uint32_t h = 0x811c9dc5u, j;
+        for (j = 0; j < n; j++) h = (h ^ buf[j]) * 0x01000193u;
+        if (h != IST->hashes[k]) n = 0;
+    }
     if (n < 28u) {                                    /* read failed -> chain        */
         IST->lru[slot].id = -1;
         return ((alt_resolver_t)(uintptr_t)ORIG_ALT_RESOLVER)(id, out_ptr);
@@ -180,11 +186,12 @@ int hb_silver_icon_grow_cache(uint32_t bytes, void *(*alloc)(uint32_t))
 
 void hb_silver_icon_reset_resolver(void)
 {
-    /* If the alt-resolver field still points into a (now-overwritten) resident
-     * build's icon_alt_resolver, restore the stock resolver so empty-slot
-     * lookups don't jump through a stale pointer. Only touch OUR value. */
+    /* If the alt-resolver field still points into DRAM (a previous resident's
+     * icon_alt_resolver, now dead), restore the stock resolver so empty-slot
+     * lookups don't jump through a stale pointer. The stock value is firmware
+     * code (below 0x08800000), so a DRAM value can only be ours. */
     uint32_t v = *(uint32_t *)(uintptr_t)ALT_RESOLVER_FIELD;
-    if (v >= 0x09130000u && v < 0x09140000u)
+    if (v != ORIG_ALT_RESOLVER && v >= 0x08d00000u && v < 0x0a000000u)
         *(uint32_t *)(uintptr_t)ALT_RESOLVER_FIELD = ORIG_ALT_RESOLVER;
 }
 
@@ -406,9 +413,7 @@ long hb_silver_icon_register_lazy(int count, void *(*alloc)(uint32_t))
     return IST->first;
 }
 
-/* Record the bundle name for the k-th lazily-served icon, so the resolver reads
- * /Apps/Icons/<name>.bin instead of /Apps/Icons/<k>.bin. Call after
- * hb_silver_icon_register_lazy, once per app, on the UI task (per boot). */
+/* Set the actual folder name (or legacy filename) before publishing Home. */
 void hb_silver_icon_set_name(int k, const char *name)
 {
     char *slot;
@@ -418,6 +423,23 @@ void hb_silver_icon_set_name(int k, const char *name)
     slot = (char *)(uintptr_t)(IST->names + (uint32_t)k * ICON_NAME_MAX);
     for (j = 0; name[j] && j < (int)ICON_NAME_MAX - 1; j++) slot[j] = name[j];
     slot[j] = 0;
+}
+
+void hb_silver_icon_set_hash(int k, uint32_t hash, int bundled)
+{
+    if (k >= 0 && k < IST->count && k < 64) {
+        IST->hashes[k] = hash;
+        IST->bundled[k] = bundled != 0;
+    }
+}
+
+long hb_silver_icon_refresh(void)
+{
+    int k;
+    if (!hb_silver_icon_live()) return 0;
+    for (k = 0; k < (int)ICON_LRU_N; k++) IST->lru[k].id = -1;
+    IST->rr = 0;
+    return IST->first;
 }
 
 long hb_silver_icon_register_table(uint32_t blob_addr, void *(*alloc)(uint32_t),

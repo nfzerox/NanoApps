@@ -12,7 +12,6 @@
 
 #define PLAY_W      240
 #define PLAY_H      380
-#define CANVAS_ADDR 0x092E0000u
 #define MAX_LAYERS  40
 #define LAYER_H     16
 
@@ -28,7 +27,9 @@ static int s_score;
 static int s_view_offset;    /* world->screen y shift as tower grows */
 static int s_state;          /* 0=play, 1=fell */
 
-static uint8_t * const s_canvas_buf = (uint8_t *)CANVAS_ADDR;
+/* In the app's own arena: the old fixed 0x092E0000 lies inside the OS heap
+ * and was overwriting live objects (and sometimes this app's own code). */
+static uint8_t s_canvas_buf[PLAY_W * PLAY_H * 4] __attribute__((aligned(4)));
 static lv_obj_t *s_canvas;
 static lv_obj_t *s_score_lbl;
 

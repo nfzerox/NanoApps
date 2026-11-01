@@ -1,0 +1,14 @@
+# Original game packages, assets, and raw decompiler output remain local.
+downloads/
+original/
+decomp/
+ghidra/proj/
+ghidra/*.log
+build/
+__pycache__/
+.venv/
+port/build/
+analysis/objc.txt
+analysis/disassembly.txt
+.DS_Store
+analysis/functions.tsv

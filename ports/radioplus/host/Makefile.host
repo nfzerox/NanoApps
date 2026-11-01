@@ -1,0 +1,52 @@
+# Desktop build of the Radio+ core.
+#
+# core/ has no dependencies at all - no SDK, no LVGL, no libc beyond string.h -
+# so the encoder, the register table and the field packing can be exercised on
+# a workstation with no tuner, no iPod and no Bluetooth stack anywhere near it.
+# That is the point of keeping the transport out of it.
+#
+#   cd host && make -f Makefile.host test
+
+CC      ?= cc
+BUILD   := build
+CORE    := ../core
+
+CFLAGS  := -O1 -g -std=c99 -Wall -Wextra -Wshadow -Wconversion \
+           -Wno-sign-conversion -Wpointer-arith -Wcast-qual
+
+# The table is hand-transcribed from a specification, so the checks that matter
+# most are the ones that run under a sanitiser: a bad bit offset shows up as an
+# out-of-bounds read long before it shows up as a wrong register write.
+ifneq ($(NOSAN),1)
+CFLAGS  += -fsanitize=address,undefined -fno-omit-frame-pointer
+LDFLAGS += -fsanitize=address,undefined
+endif
+
+SRCS := tests.c $(CORE)/fmcmd.c $(CORE)/fmreg.c $(CORE)/rds.c $(CORE)/rdsname.c $(CORE)/ctscan.c $(CORE)/region.c $(CORE)/wav.c $(CORE)/store.c $(CORE)/scan.c $(CORE)/timer.c $(CORE)/affollow.c ../../../apps/build_stamp.c
+HDRS := $(wildcard $(CORE)/*.h)
+
+
+# ---- build stamp -----------------------------------------------------------
+#
+# Which build is this. An app sitting on the device that is months old looks
+# exactly like the one just compiled, right up until an afternoon goes into
+# debugging something that was fixed in April.
+BUILD_STAMP := $(shell date -u +%Y%m%d.%H%M)
+BUILD_GIT   := $(shell git rev-parse --short=7 HEAD 2>/dev/null || echo nogit)
+CFLAGS += -DEN_BUILD_STAMP='"$(BUILD_STAMP)"' -DEN_BUILD_GIT='"$(BUILD_GIT)"'
+
+.PHONY: all test clean
+
+all: $(BUILD)/tests
+
+$(BUILD):
+	@mkdir -p $(BUILD)
+
+$(BUILD)/tests: $(SRCS) $(HDRS) | $(BUILD)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(SRCS)
+
+test: $(BUILD)/tests
+	@$(BUILD)/tests
+
+clean:
+	rm -rf $(BUILD)

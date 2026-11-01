@@ -1,0 +1,133 @@
+# Headless preview of the Radio+ interface.
+#
+# Renders every screen into a memory buffer and writes PNGs. No display, no SDL,
+# no hardware - which is what makes it possible to look at all the screens side
+# by side while laying them out, rather than one at a time on an iPod.
+#
+#   cd host && make -f Makefile.preview shots
+#
+# This used to borrow the Entrain host build's LVGL archive, on the grounds
+# that the two apps had the same lv_conf and building it twice bought nothing.
+# They no longer do: the landscape readout needs ARGB8888 in the software
+# renderer, which no other app in the repo wants. Radio+ therefore builds its
+# own, which also means this target works from a clone of this app alone rather
+# than requiring a sibling app to have been built first.
+
+CC     ?= cc
+BUILD  := build
+LVGL   ?= ../../../lvgl
+CORE   := ../core
+PLAT   := ../platform
+
+# Compile LVGL from a native mirror rather than across the Windows mount, which
+# is nineteen times faster - see apps/lvgl-mirror.mk for the measurement.
+include ../../../apps/lvgl-mirror.mk
+
+LV_CONF    := lv_conf_host.h
+LV_CFLAGS  := -DLV_CONF_INCLUDE_SIMPLE -DLV_CONF_PATH=\"$(CURDIR)/$(LV_CONF)\" \
+              -I$(LVGL_SRC) -I$(LVGL_SRC)/src -I$(LVGL_SRC)/include -I$(LVGL_SRC)/.. -I..
+
+CFLAGS := -O1 -g -std=gnu99 -Wall -Wextra -Wno-unused-parameter
+
+# Objects live on the native filesystem under a directory named for the hash of
+# the config that produced them. Two reasons, both measured on this tree: the
+# Windows drive costs more in filesystem time than the compiler costs in CPU,
+# and lv_conf is a tracked file whose mtime moves on every branch switch even
+# when not one byte of it changed.
+CCACHE     := $(shell command -v ccache 2>/dev/null)
+LV_CONF_ID := $(shell md5sum $(LV_CONF) 2>/dev/null | cut -c1-12)
+LV_CACHE   ?= $(HOME)/.cache/n31-lvgl/radioplus-host-$(LV_CONF_ID)
+
+# LVGL, minus the drivers that need a library this build does not link.
+# Not 'minus all drivers': lv_conf enables LV_USE_EVDEV, so lv_init.c
+# references lv_evdev_deinit whether or not this target ever opens an input
+# device, and excluding the whole directory left that undefined at link time.
+# evdev and fbdev need nothing but ioctls, so they compile here harmlessly.
+LV_SRCS := $(shell find $(LVGL_SRC)/src -name '*.c' \
+             -not -name 'lv_freertos.c' -not -name 'lv_cmsis_rtos2.c' \
+             -not -name 'lv_mqx.c'      -not -name 'lv_rtthread.c' \
+             -not -name 'lv_windows.c'  -not -name 'lv_sdl2.c' \
+             -not -path '*/drivers/nuttx/*'    -not -path '*/drivers/qnx/*' \
+             -not -path '*/drivers/uefi/*'     -not -path '*/drivers/windows/*' \
+             -not -path '*/drivers/wayland/*'  -not -path '*/drivers/x11/*' \
+             -not -path '*/drivers/libinput/*' -not -path '*/drivers/opengles/*' \
+             -not -path '*/drivers/sdl/*'      -not -path '*/drivers/display/drm/*' \
+             2>/dev/null)
+
+LV_OBJS := $(patsubst $(LVGL_SRC)/%.c,$(LV_CACHE)/%.o,$(LV_SRCS))
+LVLIB   := $(LV_CACHE)/liblvgl_preview.a
+
+SRCS := preview.c ../ui.c $(PLAT)/model_host.c $(PLAT)/clock_stub.c \
+        $(CORE)/fmcmd.c $(CORE)/fmreg.c $(CORE)/rds.c $(CORE)/rdsname.c $(CORE)/ctscan.c $(CORE)/region.c \
+        $(CORE)/wav.c $(CORE)/store.c $(CORE)/scan.c $(CORE)/timer.c $(CORE)/affollow.c ../../../apps/build_stamp.c
+
+
+# ---- build stamp -----------------------------------------------------------
+#
+# Which build is this. An app sitting on the device that is months old looks
+# exactly like the one just compiled, right up until an afternoon goes into
+# debugging something that was fixed in April.
+BUILD_STAMP := $(shell date -u +%Y%m%d.%H%M)
+BUILD_GIT   := $(shell git rev-parse --short=7 HEAD 2>/dev/null || echo nogit)
+CFLAGS += -DEN_BUILD_STAMP='"$(BUILD_STAMP)"' -DEN_BUILD_GIT='"$(BUILD_GIT)"'
+
+.PHONY: shots publish clean clean-lvgl
+
+# Stated rather than implied: adding a rule above the first target silently
+# makes THAT what a bare `make` builds.
+.DEFAULT_GOAL := shots
+
+shots: $(BUILD)/preview
+	@mkdir -p shots
+	@./$(BUILD)/preview shots
+	@python3 tobmp.py shots && rm -f shots/*.bmp
+	@ls shots/
+
+# The subset the README embeds, under the names it embeds them by.
+#
+# These used to be copied across by hand, which meant the pictures in the
+# README were whatever somebody last remembered to copy: the set committed to
+# the repository was three weeks and two screens out of date before anyone
+# noticed. A rename table is the whole difference between documentation that
+# drifts and documentation that cannot.
+#
+# Numbered on the left because the shot list is ordered by screen and reads
+# better that way. Plain on the right because a README should not have to know.
+PUBLISH := \
+	0a-boot:boot 0-simple:simple 1-now:now 7-now-recording:recording \
+	1d-now-volume:volume \
+	1b-wide:wide 2-dial:dial 3-presets:presets \
+	3b-presets-scanning:scanning 4-recordings:recordings \
+	5-settings:settings 6-advanced:advanced 10-reg-blend:register \
+	6b-rds:rds 6c-clock:clock
+
+publish: shots
+	@mkdir -p ../screenshots
+	@for m in $(PUBLISH); do \
+	   src=shots/$${m%%:*}.png; dst=../screenshots/$${m##*:}.png; \
+	   if [ -f "$$src" ]; then cp -f "$$src" "$$dst"; \
+	   else echo "  MISSING $$src" >&2; exit 1; fi; \
+	 done
+	@echo "  published to ../screenshots"
+
+# No lv_conf prerequisite: the cache directory name already carries that file's
+# hash, so a config change selects different objects rather than invalidating
+# these by timestamp.
+$(LV_CACHE)/%.o: $(LVGL_SRC)/%.c
+	@mkdir -p $(dir $@)
+	@$(CCACHE) $(CC) $(CFLAGS) -w $(LV_CFLAGS) -c -o $@ $<
+
+$(LVLIB): $(LV_OBJS)
+	@echo "  AR  $@"
+	@ar crs $@ $^
+
+$(BUILD)/preview: $(SRCS) $(wildcard $(CORE)/*.h $(PLAT)/*.h ../*.h) $(LVLIB)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) $(LV_CFLAGS) -o $@ $(SRCS) $(LVLIB) -lm -lpthread
+
+clean:
+	rm -rf $(BUILD) shots
+
+# Leaves the LVGL cache alone, which is the point of it.
+clean-lvgl:
+	rm -rf $(LV_CACHE)

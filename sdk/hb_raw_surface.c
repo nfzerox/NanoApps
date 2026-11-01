@@ -2,12 +2,13 @@
  * hb_raw_surface.c — direct-draw Silver surface runtime. See hb_raw_surface.h.
  *
  * The resident loads the relocatable blob into an arena and calls
- * payload_entry(0, fb, w, h); we zero .bss, hand the app the framebuffer, and
+ * payload_entry(0, fb, w, h, shared); we zero .bss, hand the app the framebuffer, and
  * return the per-frame fn the resident calls on its ~60 fps heartbeat (after
  * which it blits the framebuffer to the screen). No LVGL — the app draws pixels
  * straight into fb.
  */
 #include "hb_raw_surface.h"
+#include "hb_shared.h"
 
 static uint32_t *s_fb;
 static int s_w, s_h;
@@ -82,18 +83,19 @@ static void raw_surface_frame(void)
     hb_raw_frame(&p);
 }
 
-/* Entry — the resident calls entry(0, fb, w, h) on every launch. Zero our .bss
+/* Entry — the resident calls entry(0, fb, w, h, shared) on every launch. Zero our .bss
  * each launch (a cached relaunch re-enters here without reloading the image), set
  * up, and return the per-frame fn. The reloc loader already flushed the I-cache
  * over the arena, so no SVC flush here (raw apps are always RELOC). */
 __attribute__((section(".text.entry"), used, noinline))
-void *payload_entry(int op, void *fb, int w, int h)
+void *payload_entry(int op, void *fb, int w, int h, hb_shared_t *sh)
 {
     extern unsigned int __bss_start__[], __bss_end__[];
     unsigned int *p;
-    if (op != 0)
+    if (op != 0 || !sh || sh->magic != HB_SHARED_MAGIC || sh->version != HB_SHARED_VERSION)
         return 0;
     for (p = __bss_start__; p < __bss_end__; p++) *p = 0;
+    hb_shared = sh;                     /* after the bss clear (it lives there) */
     s_fb = (uint32_t *)fb; s_w = w; s_h = h;
     hb_raw_init(w, h);
     return (void *)&raw_surface_frame;

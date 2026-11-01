@@ -9,7 +9,7 @@
  * of the framebuffer — contiguous (fb stride == canvas width), so load/save is a
  * single block read/write.
  *
- * Storage (/Apps/Data/Paint):
+ * Storage (/Data/Paint):
  *   <id>.bin   full canvas, 240x320 XRGB8888 (307200 B)
  *   <id>.tmb   thumbnail, 48x64 XRGB8888 (5x downsample, 12288 B)
  */
@@ -35,7 +35,7 @@
 #define THUMB_BYTES (TW * TH * 4)
 #define CANVAS_BYTES (CANVAS_W * CANVAS_H * 4)
 
-#define DATA_DIR    "/Apps/Data/Paint"
+#define DATA_DIR    "/Data/Paint"
 #define MAX_DRAWINGS 60
 
 static const uint32_t PALETTE[PAL_N] = {

@@ -16,8 +16,13 @@
  */
 
 #include "hb_app_bundle.h"
+#include "hb_app_catalog.h"
 #include "hb_silver_icon.h"
 #include "hb_silver_res.h"
+
+/* Reused across refreshes; do not append another set of resource-chain nodes. */
+static void *s_label_obj[64], *s_label_node[64];
+static uint8_t s_pool_grown;
 
 static const hb_app_section_t *hb__find_section(const uint8_t *b,
                                                 const hb_app_bundle_t *hdr,
@@ -35,7 +40,8 @@ static const hb_app_section_t *hb__find_section(const uint8_t *b,
 int hb_app_register_pack(const void *pack_v, void *(*alloc)(uint32_t size),
                          void (*trace)(const char *, uint32_t, uint32_t),
                          hb_app_launch_t *out_apps, int max,
-                         void *screen_obj, void *screen_node, int register_to_os)
+                         void *screen_obj, void *screen_node, int register_to_os,
+                         const struct hb_app_files *files)
 {
     int screen_done = 0;
     const uint8_t *pack = (const uint8_t *)pack_v;
@@ -45,30 +51,52 @@ int hb_app_register_pack(const void *pack_v, void *(*alloc)(uint32_t size),
     uint32_t bmh[64], lens[64];
     int icon_app[64], nicons = 0, count = 0;
     long first_icon, app_icon[64];
+    uint8_t publish_label[64], publish_screen[64];
 
     if (!pack || ph->magic != HB_APP_PACK_MAGIC || !alloc || !out_apps || max <= 0)
         return 0;
     n = ph->count;
-    if (n == 0u || n > 64u)
+    if (n > 64u)
         return 0;
     offs = (const uint32_t *)(pack + sizeof(hb_app_pack_t));
 
-    for (a = 0; a < n; a++)
+    if (register_to_os == 2)
+        for (a = 0; a < 64u; a++) hb_silver_resdb_unpublish(s_label_node[a]);
+
+    for (a = 0; a < n; a++) {
+        const uint8_t *b = pack + offs[a];
+        const hb_app_bundle_t *hdr = (const hb_app_bundle_t *)b;
         app_icon[a] = -1;
+        publish_label[a] = 0;
+        publish_screen[a] = 0;
+        if (hdr->magic == HB_APP_BUNDLE_MAGIC) {
+            /* Snapshot chain state before publishing anything. Apps commonly
+             * share one tag, so checking inside the mutation loop would publish
+             * only the first DB and skip the remaining label DBs. A Power+Home
+             * reboot can preserve the icon/home model while rebuilding this
+             * resource chain; resource publication must therefore be gated
+             * independently from icon/home registration. */
+            if (hdr->label_tag)
+                publish_label[a] = register_to_os == 2 || !hb_silver_resdb_has_tag(hdr->label_tag);
+            if (hdr->screen_tag)
+                publish_screen[a] = !hb_silver_resdb_has_tag(hdr->screen_tag);
+        }
+    }
 
     /* phase 1 (OS mutation, once per boot): register every app's icon LAZILY —
      * disk-backed, served on demand via the cache's alt-resolver through a small
-     * LRU. The bitmaps live on disk (/Apps/Icons/<CFBundleName>.bin), NOT in heap,
+     * LRU. The bitmaps live on disk in each app folder (or legacy Icons/),
      * so heap stays bounded regardless of count (vs the old pin-all pack copy).
      * Each app a gets icon id first_icon + a (the resolver maps id-first -> the
      * a-th disk file). Skipped on a re-deploy. */
-    if (register_to_os) {
+    if (register_to_os && (n || hb_silver_icon_live())) {
         /* Grow the OS bitmap cache so our 56 ring entries don't make its frequent
          * evictions (the 625 KB pool is already near-full) walk a long ring each
          * time. Smaller than pin-all needed since our bitmaps aren't in the pool. */
-        if (n > 8u)
-            hb_silver_icon_grow_cache(1u * 1024u * 1024u, alloc);
-        first_icon = hb_silver_icon_register_lazy((int)n, alloc);
+        if (!s_pool_grown && n > 8u)
+            s_pool_grown = hb_silver_icon_grow_cache(1u * 1024u * 1024u, alloc) != 0;
+        first_icon = register_to_os == 2 ? hb_silver_icon_refresh() :
+                     hb_silver_icon_register_lazy(64, alloc);
         if (trace)
             trace("PKICON  ", (uint32_t)first_icon, (uint32_t)n);
         for (a = 0; a < n; a++)
@@ -96,37 +124,48 @@ int hb_app_register_pack(const void *pack_v, void *(*alloc)(uint32_t size),
             continue;
 
         sbid = (const char *)(b + hdr->sbid_off);
-        name = (const char *)(b + hdr->name_off);  /* CFBundleName: disk file name */
+        name = (const char *)(b + hdr->name_off);  /* manifest key or legacy filename */
         icon_id = (app_icon[a] >= 0) ? app_icon[a] : 0;
 
-        if (register_to_os) {
-            /* publish this app's label DB (once per boot; apps may share a chain
-             * tag, e.g. 'HBap') */
+        if (publish_label[a]) {
+            /* Publish this app's label DB whenever the OS resource chain was
+             * rebuilt, even if the bitmap cache and Home model survived. */
             lab = hb__find_section(b, hdr, HB_SEC_LABEL);
             if (lab && hdr->label_tag) {
-                void *obj  = alloc(HB_SILVER_RESDB_OBJ_SIZE);
-                void *node = alloc(HB_SILVER_RESDB_NODE_SIZE);
+                void *obj  = s_label_obj[a];
+                void *node = s_label_node[a];
+                if (!obj) obj = s_label_obj[a] = alloc(HB_SILVER_RESDB_OBJ_SIZE);
+                if (!node) node = s_label_node[a] = alloc(HB_SILVER_RESDB_NODE_SIZE);
                 if (obj && node) {
                     void *db = hb_silver_resdb_open(obj, b + lab->off, lab->len);
                     hb_silver_resdb_publish(db, hdr->label_tag, node);
                 }
             }
-            /* open the first app's screen DB at the caller's fixed storage so the
-             * resident's resource getter patch serves it (one custom screen for now) */
-            if (!screen_done && screen_obj) {
+        }
+        /* Reopen the fixed screen DB object on EVERY deploy. Its resource blob
+         * belongs to this deploy's heap copy of the pack, so a retained chain
+         * tag cannot prove the old object/blob pointer survived a warm reboot.
+         * Only insertion of its chain node is conditional. */
+        if (!screen_done && screen_obj) {
                 const hb_app_section_t *scr = hb__find_section(b, hdr, HB_SEC_SCREEN);
                 if (scr) {
                     void *db = hb_silver_resdb_open(screen_obj, b + scr->off, scr->len);
-                    if (hdr->screen_tag && screen_node)
+                    if (publish_screen[a] && hdr->screen_tag && screen_node)
                         hb_silver_resdb_publish(db, hdr->screen_tag, screen_node);
                     screen_done = 1;
                     if (trace)
                         trace("PKSCRN  ", hdr->app_id, scr->len);
                 }
-            }
+        }
+        if (register_to_os) {
+            /* Name the disk-backed icon before publishing the Home item. The
+             * item add can render immediately; publishing first briefly sent
+             * the resolver to the numeric fallback (0.bin, 1.bin, ...). */
+            hb_silver_icon_set_name((int)a,
+                files && files[a].standalone ? files[a].folder : name);
+            hb_silver_icon_set_hash((int)a, files ? files[a].icon_hash : 0,
+                                   files ? files[a].standalone : 0);
             hb_silver_home_add_item(sbid, (int)hdr->label_id, (int)icon_id);
-            /* name the k-th disk icon (k == pack index a) by CFBundleName */
-            hb_silver_icon_set_name((int)a, name);
         }
 
         L = &out_apps[count];

@@ -15,7 +15,7 @@
  * future per-pass directory and the detail view will pick it up
  * (tracked as a follow-up).
  *
- * Storage: /Apps/Data/Wallet/items.txt — one pass per line:
+ * Storage: /Data/Wallet/items.txt — one pass per line:
  *   title<TAB>subtitle<TAB>code<TAB>color_hex<NL>
  */
 #include "hb_sdk.h"
@@ -26,8 +26,8 @@
 
 #define MAX_PASSES   32
 #define MAX_FIELD    64
-#define DATA_DIR     "/Apps/Data/Wallet"
-#define ITEMS_PATH   "/Apps/Data/Wallet/items.txt"
+#define DATA_DIR     "/Data/Wallet"
+#define ITEMS_PATH   "/Data/Wallet/items.txt"
 #define FILE_BUF_SZ  (MAX_PASSES * (MAX_FIELD * 3 + 16))
 
 typedef struct {
@@ -688,7 +688,7 @@ static void build_field_input(void)
 HB_APP_ENTRY(payload_entry)
 {
     hb_trace_init();
-    hb_fs_mkdir("/Apps/Data");
+    hb_fs_mkdir("/Data");
     hb_fs_mkdir(DATA_DIR);
     load_passes();
 

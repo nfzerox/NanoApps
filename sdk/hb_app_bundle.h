@@ -99,9 +99,12 @@ typedef struct {
  * re-fill out_apps[] (the tap-routing table) — safe to run on every resident
  * re-deploy so taps keep working without a reboot. out_apps is always filled.
  */
+struct hb_app_files;
+/* register_to_os: 0 = routing only, 1 = initial registration, 2 = live refresh. */
 int hb_app_register_pack(const void *pack, void *(*alloc)(uint32_t size),
                          void (*trace)(const char *, uint32_t, uint32_t),
                          hb_app_launch_t *out_apps, int max,
-                         void *screen_obj, void *screen_node, int register_to_os);
+                         void *screen_obj, void *screen_node, int register_to_os,
+                         const struct hb_app_files *files);
 
 #endif /* HB_APP_BUNDLE_H */

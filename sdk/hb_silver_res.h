@@ -59,6 +59,8 @@ int hb_silver_resdb_publish(void *resdb, unsigned int tag4cc, void *node_storage
  * RAM marker, isn't fooled by DRAM surviving a warm panic-reboot.
  */
 int hb_silver_resdb_has_tag(unsigned int tag4cc);
+/* Unlink one caller-owned node before reusing its DB/blob during a refresh. */
+void hb_silver_resdb_unpublish(void *node_storage);
 
 /*
  * Add a home-screen item with id string `sbid`, resolving its label and icon
@@ -67,6 +69,8 @@ int hb_silver_resdb_has_tag(unsigned int tag4cc);
  * fully custom item, or existing stock ids to borrow.
  */
 void hb_silver_home_add_item(const char *sbid, int label_id, int image_id);
+/* Stock hide-item operation; updates page positions and posts model notices. */
+void hb_silver_home_hide_item(const char *sbid);
 
 /*
  * Rebuild every springboard page cell from the model. Call ONCE after a batch of

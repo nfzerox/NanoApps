@@ -1,0 +1,99 @@
+name: Build and release
+
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: '3.12'
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-arm-none-eabi binutils-arm-none-eabi libnewlib-arm-none-eabi build-essential pkg-config libssl-dev cmake
+          python -m venv .venv
+          .venv/bin/python -m pip install -r tools/requirements-release.txt
+          toolchain=$(sed -n 's/^channel = "\(.*\)"/\1/p' firmware/rust-toolchain.toml)
+          rustup toolchain install "$toolchain" --profile minimal --target thumbv6m-none-eabi
+          rustup default "$toolchain"
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+      - name: Prepare firmware cache key
+        id: firmware
+        run: |
+          python tools/build_firmware.py --fingerprint-file build/firmware-key
+          echo "key=$(cat build/firmware-key)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: build/firmware-cache
+          key: firmware-${{ runner.os }}-${{ steps.firmware.outputs.key }}
+      - name: Build and verify both IPSWs and the disk ZIP
+        run: python tools/build_release.py
+      - name: Check loader, resident, demo hooks and installer
+        run: |
+          make -s -C tools/fixtures/untether_bootstrap
+          PYTHONPATH=tools python -m unittest test_firmware_publisher test_untether test_demo_statusbar test_compat_fixes test_device_reboot test_app_install test_release test_app_packages test_live_apps test_deferred_stage test_disk_bootstrap test_checked_reloc_loader test_firmware_cache
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release
+          path: build/release/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  publish:
+    needs: build
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: release
+          path: release
+      - name: Publish the complete release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          COMMIT: ${{ github.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release
+          sha256sum --check SHA256SUMS
+          tag="build-$COMMIT"
+          if draft=$(gh release view "$tag" --json isDraft --jq .isDraft); then
+            if [ "$draft" = false ]; then
+              echo "This commit already has a published release."
+              exit 0
+            fi
+          else
+            cat > notes.txt <<EOF
+          Built automatically from [$COMMIT](https://github.com/$GH_REPO/commit/$COMMIT).
+
+          Download NanoApps-2012-Model.ipsw or NanoApps-2015-Model.ipsw for your iPod nano and NanoApps-disk.zip from this release. Follow [Download and Install NanoApps](https://github.com/$GH_REPO/blob/$COMMIT/README.md#download-and-install-nanoapps).
+          EOF
+            gh release create "$tag" --target "$COMMIT" --draft \
+              --title "NanoApps — ${COMMIT:0:7}" --notes-file notes.txt
+          fi
+          gh release upload "$tag" NanoApps-2012-Model.ipsw NanoApps-2015-Model.ipsw NanoApps-disk.zip build.json SHA256SUMS --clobber
+          # Preserve every push's release, but keep an older build finishing
+          # later from replacing the current head's latest-release link.
+          head=$(gh api "repos/$GH_REPO/commits/$DEFAULT_BRANCH" --jq .sha)
+          latest=false
+          if [ "$COMMIT" = "$head" ]; then latest=true; fi
+          gh release edit "$tag" --draft=false --latest="$latest"

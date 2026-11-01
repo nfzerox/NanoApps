@@ -8,7 +8,7 @@
  *   else   -> MISS    (combo break)
  *
  * Built-in track is a hand-tuned 30-second sequence with a 480-BPM
- * pulse. Drop additional tracks at /Apps/Data/Rhythm/<name>.txt
+ * pulse. Drop additional tracks at /Data/Rhythm/<name>.txt
  * (one note per line: "<time_ms> <lane>"; lane 0..3).
  */
 #include "hb_sdk.h"
@@ -17,7 +17,6 @@
 
 #define PLAY_W       240
 #define PLAY_H       380
-#define CANVAS_ADDR  0x092E0000u
 #define LANES        4
 #define MAX_NOTES    300
 #define TRAVEL_MS    1400      /* time from spawn to target */
@@ -42,7 +41,9 @@ static const char *s_judge_label = "";
 static uint32_t s_lane_flash_until[LANES];
 static uint32_t s_lane_glow_until[LANES];
 
-static uint8_t * const s_canvas_buf = (uint8_t *)CANVAS_ADDR;
+/* In the app's own arena: the old fixed 0x092E0000 lies inside the OS heap
+ * and was overwriting live objects (and sometimes this app's own code). */
+static uint8_t s_canvas_buf[PLAY_W * PLAY_H * 4] __attribute__((aligned(4)));
 static lv_obj_t *s_canvas;
 static lv_obj_t *s_score_lbl;
 static lv_obj_t *s_combo_lbl;
@@ -83,9 +84,9 @@ static const uint8_t s_builtin_l[] = {
     0, 1, 2, 3, 0, 2, 1, 3
 };
 
-#define TRACK_DIR "/Apps/Data/Rhythm"
+#define TRACK_DIR "/Data/Rhythm"
 
-/* If /Apps/Data/Rhythm/track.txt exists, load it. Each line is
+/* If /Data/Rhythm/track.txt exists, load it. Each line is
  * "<time_ms> <lane>" with whitespace separators. Returns true if a
  * track was loaded. */
 static bool load_custom_track(void)

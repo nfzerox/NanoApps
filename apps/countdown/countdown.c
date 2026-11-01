@@ -11,9 +11,9 @@
  *     Save / Delete actions.
  *   - Name editor sub-view: T9 keyboard over a textarea.
  *
- * Storage: /Apps/Data/CountdownDays/items.txt — one line per item:
+ * Storage: /Data/CountdownDays/items.txt — one line per item:
  *   "YYYY-MM-DD<TAB>repeats<TAB>name"
- * View mode persisted at /Apps/Data/CountdownDays/mode.
+ * View mode persisted at /Data/CountdownDays/mode.
  *
  * Yearly repeats: when computing days_until for a repeating event we
  * advance its target year forward until target_date >= today. So a
@@ -30,9 +30,9 @@
 #define MAX_ITEMS    64
 #define MAX_NAME     48
 #define FILE_BUF_SZ  (MAX_ITEMS * (MAX_NAME + 16))
-#define DATA_DIR     "/Apps/Data/CountdownDays"
-#define ITEMS_PATH   "/Apps/Data/CountdownDays/items.txt"
-#define MODE_PATH    "/Apps/Data/CountdownDays/mode"
+#define DATA_DIR     "/Data/CountdownDays"
+#define ITEMS_PATH   "/Data/CountdownDays/items.txt"
+#define MODE_PATH    "/Data/CountdownDays/mode"
 
 #define MODE_LIST 0
 #define MODE_GRID 1
@@ -857,7 +857,7 @@ HB_APP_ENTRY(payload_entry)
 {
     hb_trace_init();
 
-    hb_fs_mkdir("/Apps/Data");
+    hb_fs_mkdir("/Data");
     hb_fs_mkdir(DATA_DIR);
     build_year_opts();
     load_mode();

@@ -1,11 +1,11 @@
 /*
  * hb_prefs — system-wide user preferences (theme, status bar, home
- * button) persisted under /Apps/Data/Settings/.
+ * button) persisted under /Data/Settings/.
  *
  * Files (one value each, plain text):
- *   /Apps/Data/Settings/theme        — "light" | "dark" | "auto" (default)
- *   /Apps/Data/Settings/status_bar   — "1" (default) or "0"
- *   /Apps/Data/Settings/home_button  — "launcher" (default) or "os"
+ *   /Data/Settings/theme        — "light" | "dark" | "auto" (default)
+ *   /Data/Settings/status_bar   — "1" (default) or "0"
+ *   /Data/Settings/home_button  — "launcher" (default) or "os"
  *
  * Tint has no file: hb_tint_color() always follows the device
  * color (hb_devcolor_tint()), so every homebrew app matches the

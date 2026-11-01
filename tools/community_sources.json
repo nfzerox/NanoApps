@@ -1,0 +1,56 @@
+{
+  "baseline": "5d307e4",
+  "firmware": "1.1.2 / 39A10023",
+  "sources": [
+    {
+      "repository": "https://github.com/Aydremourad/Nano-7th-Apps.git",
+      "commit": "1ad5c41e06b76baccf018ed98b09008f7e44eee6"
+    },
+    {
+      "repository": "https://github.com/andrew867/NanoApps.git",
+      "commit": "801ba9f6b8a8cde14051718bdd8a8c88811bcd54"
+    },
+    {
+      "repository": "https://github.com/Merquice/NanoBtFix.git",
+      "commit": "46ec2b7dd636d1128b30ebb521a466f9f1cebece"
+    },
+    {
+      "repository": "https://github.com/kilo2071/blueth4w.git",
+      "commit": "6cea8e1ff4e08ff93ccedfe2e851affee270d9cb"
+    },
+    {
+      "repository": "https://github.com/olievans123/nano-doodlejump.git",
+      "commit": "57fae1c5943633d207a14688811f3d4588c8de55"
+    },
+    {
+      "repository": "https://github.com/olievans123/nano-flappybird.git",
+      "commit": "7cc3184eb34747a6903dab20ba944cb8a7592231"
+    },
+    {
+      "repository": "https://github.com/olievans123/nano-templerun.git",
+      "commit": "b73a3d43f6d26147198060cdb28b6b55d59418a1"
+    },
+    {
+      "repository": "https://github.com/Raphmatt/nano7-a1717-dock.git",
+      "commit": "9c13794530a81cdf2004611bafbe9c0af81e7195"
+    },
+    {
+      "repository": "https://github.com/olievans123/nano7-untethered.git",
+      "commit": "7a0f097650f50cf2fbd244984e340db8c04827e3"
+    },
+    {
+      "repository": "https://github.com/ninjaprawn/ipod_sun.git",
+      "commit": "ef79e7a0bcee7b7f9eab9527ab95d60190e385db",
+      "branch": "qol"
+    }
+  ],
+  "notes": {
+    "blueth4w": "1.0.4 implementation excluded; only 1.1.2 is supported",
+    "Nano-7th-Apps": "Installer behavior evaluated; archive and opaque payloads not imported",
+    "n31launcher": "Linux OS launcher excluded from RetailOS integration",
+    "ports": "User-supplied original game assets required; excluded from default app discovery",
+    "firmware-tests": "Superseded C6/96 publishers, fixed three-app release fixtures, and historical decoder scripts excluded; current C6/98 publisher and packaged-CFF checks maintained.",
+    "generated-data": "Donor analysis output, prebuilt payloads, nested CI, firmware images and Apple bootloaders excluded from version control.",
+    "compatibility-fixes": "NanoBtFix and A1717 are automatic, byte-checked RAM fixes in the disk-loaded resident; no standalone repair apps or fixed-address payload."
+  }
+}

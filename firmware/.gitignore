@@ -1,0 +1,12 @@
+/target
+.idea
+*.img1
+*.MSE
+.DS_Store
+build.sh
+*.bin
+.venv/
+*.ipsw
+*.cff
+__pycache__/
+*.py[cod]

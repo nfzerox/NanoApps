@@ -33,4 +33,14 @@ void *hb_os_alloc(uint32_t size);
 /* Free a block returned by hb_os_alloc (the matched free entry). */
 void hb_os_free(void *p);
 
+/* One app-owned hb_os_alloc block that the resident frees when it unloads the
+ * app (app switch / relaunch after quit) and clears at boot. For buffers too big
+ * for .bss that would otherwise leak: LVGL apps get no quit callback, and their
+ * .bss (holding the pointer) is re-zeroed on every launch. Free any previous
+ * block before storing a new one. Never use a fixed DRAM address as a buffer —
+ * 0x0910xxxx-0x094xxxxx is live OS heap. The slot lives in the resident's
+ * shared block (hb_shared.h), set before any app code runs. */
+#include "hb_shared.h"
+#define HB_APP_AUX_BLOCK      (hb_shared->aux_block)
+
 #endif /* HB_HEAP_H */

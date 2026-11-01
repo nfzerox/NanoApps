@@ -1,19 +1,20 @@
 /*
  * books — plain-text book reader with paging + bookmarks.
  *
- * Library view: scrollable list of .txt files in /Apps/Data/Books/.
+ * Library view: scrollable list of .txt files in /Data/Books/.
  * Reader view: shows one "page" of the book at a time (~30 lines of
  * 14-pt text). Tap left third to go back, right two-thirds to go
  * forward. Reading position is persisted per book at
- * /Apps/Data/Books/.pos.<name> so reopening a book picks up where
+ * /Data/Books/.pos.<name> so reopening a book picks up where
  * you left off.
  *
  */
 #include "hb_sdk.h"
 #include "hb_prefs.h"
+#include "hb_heap.h"
 #include "lvgl/lvgl.h"
 
-#define DATA_DIR     "/Apps/Data/Books"
+#define DATA_DIR     "/Data/Books"
 #define MAX_BOOKS    64
 #define MAX_FILENAME 64
 #define PAGE_CHARS   700
@@ -21,7 +22,6 @@
  * heap. Instead we park the book body at a fixed high-DRAM address
  * (above the per-app canvas scratch and Paint thumb pool) so we can
  * comfortably hold real Project Gutenberg novels. */
-#define BOOK_BLOB_ADDR  0x09400000u
 #define MAX_BOOK_SZ     (2 * 1024 * 1024)   /* 2 MB cap per book */
 
 typedef struct {
@@ -302,11 +302,21 @@ static void on_reader_tap(lv_event_t *e)
     }
 }
 
+/* The book text lives in an OS-heap block registered as the app's aux block, so
+ * the resident frees it if the user quits mid-book (the old fixed 0x09400000
+ * buffer lay inside the live OS heap). */
+static void book_blob_free(void)
+{
+    hb_os_free(HB_APP_AUX_BLOCK);
+    HB_APP_AUX_BLOCK = 0;
+    s_book_blob = NULL;
+}
+
 static void on_back_to_library(lv_event_t *e)
 {
     (void)e;
     save_position();
-    s_book_blob = NULL;
+    book_blob_free();
     show_library();
 }
 
@@ -324,7 +334,7 @@ static void show_library(void)
                               LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
         lv_obj_t *empty = lv_label_create(s_list_box);
         lv_label_set_text(empty,
-            "No books yet.\nDrop .txt files into\n/Apps/Data/Books/");
+            "No books yet.\nDrop .txt files into\n/Data/Books/");
         lv_obj_set_style_text_color(empty, lv_color_hex(hb_color_text_dim()), 0);
         lv_obj_set_width(empty, lv_pct(90));
         lv_obj_set_style_text_align(empty, LV_TEXT_ALIGN_CENTER, 0);
@@ -353,7 +363,6 @@ static void show_library(void)
 static void show_reader(int idx)
 {
     if (idx < 0 || idx >= s_n_books) return;
-    s_view = VIEW_READER;
     for (int i = 0; i < MAX_FILENAME; i++) s_open_name[i] = s_books[idx].name[i];
 
     char path[256]; int pk = 0;
@@ -364,7 +373,11 @@ static void show_reader(int idx)
     uint32_t sz = s_books[idx].size;
     if (sz == 0) return;
     if (sz > MAX_BOOK_SZ) sz = MAX_BOOK_SZ;
-    s_book_blob = (char *)(uintptr_t)BOOK_BLOB_ADDR;
+    book_blob_free();
+    s_book_blob = (char *)hb_os_alloc(sz + 1u);
+    if (!s_book_blob) return;          /* no memory: stay in the library */
+    HB_APP_AUX_BLOCK = s_book_blob;
+    s_view = VIEW_READER;
     uint32_t rd = hb_fs_read(path, s_book_blob, sz);
     s_book_blob[rd < sz ? rd : sz] = 0;
     s_book_size = rd;
@@ -458,7 +471,7 @@ static void build_reader(void)
 HB_APP_ENTRY(payload_entry)
 {
     hb_trace_init();
-    hb_fs_mkdir("/Apps/Data");
+    hb_fs_mkdir("/Data");
     hb_fs_mkdir(DATA_DIR);
     scan_books();
 

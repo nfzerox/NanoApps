@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>	<string>org.nanoapps.probe</string>
+	<key>CFBundleName</key>		<string>Probe</string>
+	<key>CFBundleExecutable</key>	<string>probe</string>
+	<key>HBAppKind</key>			<integer>1</integer>
+	<key>HBIconGlyph</key>		<string>microchip</string>
+	<key>HBIconColor</key>		<string>#3aa876</string>
+</dict>
+</plist>

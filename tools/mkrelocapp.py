@@ -28,6 +28,12 @@ except ModuleNotFoundError:
              "       (or just run ./start, which installs build dependencies for you)")
 
 R_ARM_ABS32 = 2
+# Absolute relocations the loader can't apply (it only rebases 32-bit words). GCC emits
+# these for movw/movt address pairs at -O2/-O3 unless built with -mword-relocations.
+R_ARM_UNSUPPORTED_ABS = {
+    43: "R_ARM_MOVW_ABS_NC", 44: "R_ARM_MOVT_ABS",
+    47: "R_ARM_THM_MOVW_ABS_NC", 48: "R_ARM_THM_MOVT_ABS",
+}
 MAGIC = 0x31_4C_52_48  # 'HRL1' little-endian
 
 
@@ -78,10 +84,43 @@ def main(in_path, out_path, entry_sym="hb_blob_main"):
             target = elf.get_section(sec["sh_info"])
             if target is None or not (target["sh_flags"] & SH_FLAGS.SHF_ALLOC):
                 continue  # skip .rel.debug_* etc.
+            symtab = elf.get_section(sec["sh_link"])
             for r in sec.iter_relocations():
+                if r["r_info_type"] in R_ARM_UNSUPPORTED_ABS:
+                    sym = symtab.get_symbol(r["r_info_sym"])
+                    if sym["st_shndx"] != "SHN_ABS":
+                        sys.exit(f"error: {R_ARM_UNSUPPORTED_ABS[r['r_info_type']]} at "
+                                 f"{r['r_offset']:#x} ({sym.name or 'section'}): the loader only "
+                                 f"rebases 32-bit words; build with -mword-relocations")
                 if r["r_info_type"] == R_ARM_ABS32:
+                    # A reference to an absolute symbol (e.g. --just-symbols data at a fixed
+                    # segmented address) must not move with the image.
+                    sym = symtab.get_symbol(r["r_info_sym"])
+                    if sym["st_shndx"] == "SHN_ABS":
+                        continue
                     reloc_offs.append(r["r_offset"])
-        reloc_offs.sort()
+        # 4) linker-generated interworking/long-branch stubs ("veneers"). ld writes these
+        # itself (e.g. an ARM-state tail call into a Thumb function becomes
+        # "__foo_from_arm: ldr pc, [pc, #-4]; .word foo+1") and emits NO relocation for
+        # their absolute target word, so without this they jump to a base-0 address after
+        # the loader rebases the image, causing ARM/VFP builds to crash on such calls.
+        stubs = []
+        for sec in elf.iter_sections():
+            if not isinstance(sec, SymbolTableSection):
+                continue
+            for sym in sec.iter_symbols():
+                n = sym.name
+                if n.endswith(("_from_arm", "_from_thumb", "_veneer", "_change_to_arm")):
+                    stubs.append((sym["st_value"] & ~1, n))
+        LDR_PC_PC_M4 = 0xE51FF004   # ldr pc, [pc, #-4] (ARM): absolute target in next word
+        for addr, n in sorted(set(stubs)):
+            words = [struct.unpack_from("<I", image, addr + 4 * i)[0]
+                     for i in range(4) if addr + 4 * i + 4 <= progbits_end]
+            if LDR_PC_PC_M4 not in words:
+                sys.exit(f"error: linker stub {n} at {addr:#x} has an unrecognised form "
+                         f"({' '.join(f'{w:08x}' for w in words)}); the loader can't rebase it")
+            reloc_offs.append(addr + 4 * (words.index(LDR_PC_PC_M4) + 1))
+        reloc_offs = sorted(set(reloc_offs))
         for off in reloc_offs:
             if off + 4 > progbits_end:
                 sys.exit(f"error: reloc offset {off:#x} outside image")

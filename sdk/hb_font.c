@@ -213,3 +213,9 @@ void hb_draw_str(int16_t x, int16_t y, const char *s, uint8_t scale,
         x += cw;
     }
 }
+
+const uint8_t *hb_font8x8_glyph(char c)
+{
+    unsigned char u = (unsigned char)c;
+    return hb_font8x8[(u < 0x20 || u > 0x7F) ? 0 : u - 0x20];
+}

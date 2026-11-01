@@ -1,0 +1,281 @@
+# Makefile.n31 — cross-build Entrain for the N31 Linux port on iPod nano 7G.
+#
+# Produces a fully static ARM musl ELF: the device boots a 26 MB initramfs with
+# essentially no shared libraries, so anything dynamic is a non-starter.
+#
+#   make -f Makefile.n31            build build-n31/entrain
+#   make -f Makefile.n31 push       build, scp to /tmp, chmod
+#   make -f Makefile.n31 run        push, then run it on the device
+#
+# Target facts this file encodes, all read off the device rather than assumed:
+#   * /dev/fb0 is 240x432, 32 bpp, stride 960 — the same geometry and pixel
+#     format as the RetailOS build, so ui.c is used unchanged.
+#   * The CPU reports vfpv3/vfpv4 and NO neon, so no NEON anywhere.
+#   * The toolchain is arm-linux-musleabi — a SOFT-FLOAT ABI. Hardware FP
+#     instructions are still used via -mfloat-abi=$(FLOAT_ABI); -mfloat-abi=hard
+#     would produce a binary that cannot call its own libc.
+#   * ALSA is card 0 device 0 (nano7gaudio / cs42l81-hifi-0), driven through
+#     tinyalsa compiled straight in.
+
+IPOD_ROOT ?= /mnt/c/src/ipod/artifacts/linux-n31
+# Static libdrm, so LVGL can drive /dev/dri/card0 directly. Built once by
+# tools/linux-n31/build-n31-libdrm.sh in the ipod repo.
+LIBDRM    ?= $(IPOD_ROOT)/libdrm
+TOOLCHAIN ?= $(IPOD_ROOT)/tinyalsa-build/arm-linux-musleabi-cross
+
+# Which toolchain, and which float ABI.
+#
+# Overridable so a hard-float build can be made without disturbing this one.
+# The default is unchanged and stays unchanged until hard float has been shown
+# to work on hardware: this is what currently boots.
+#
+# softfp is not soft float. The FPU does the arithmetic either way; what the
+# ABI decides is whether a float crossing a function boundary travels in a VFP
+# register or in a pair of integer ones. Hard float cannot simply be switched
+# on here, because musleabi's own libc is built the other way and the link
+# fails with "uses VFP register arguments" - it needs the whole parallel
+# toolchain, and every vendored library rebuilt against it.
+#
+#   make -f Makefile.n31 \
+#     TOOLCHAIN=$(IPOD_ROOT)/toolchain-hf/arm-linux-musleabihf-cross \
+#     TRIPLE=arm-linux-musleabihf FLOAT_ABI=hard BUILD=build-n31-hf
+#
+# BUILD has to differ too. Objects of the two ABIs cannot be linked together -
+# which at least fails loudly rather than quietly - but they would happily
+# share an object directory and confuse every later build.
+TRIPLE    ?= arm-linux-musleabi
+FLOAT_ABI ?= softfp
+
+# Hard-float builds stage under a different name. The soft-float
+# artifact is what mk-initramfs.sh packs, and a parallel ABI
+# experiment must not quietly become the thing that boots.
+STAGE_SUFFIX := $(if $(filter-out softfp,$(FLOAT_ABI)),-$(FLOAT_ABI),)
+TINYALSA  ?= $(IPOD_ROOT)/tinyalsa-build/tinyalsa-2.0.0
+SSH_KEY   ?= $(IPOD_ROOT)/n31_id
+DEVICE    ?= root@192.168.7.2
+
+CROSS   := $(TOOLCHAIN)/bin/$(TRIPLE)-
+CCACHE  := $(shell command -v ccache 2>/dev/null)
+CC      := $(CCACHE) $(CROSS)gcc
+AR      := $(CROSS)ar
+STRIP   := $(CROSS)strip
+
+CORE    := ../core
+LVGL    ?= ../../../lvgl
+
+# Compile LVGL from a native mirror rather than across the Windows mount,
+# which is nineteen times faster - see apps/lvgl-mirror.mk.
+include ../../lvgl-mirror.mk
+
+BUILD   ?= build-n31
+# LVGL objects live on the native filesystem, not the Windows drive.
+#
+# A full pass measured twelve minutes wall for four and a half of CPU. The rest
+# was drvfs: four hundred and sixty-six object files written across the mount.
+#
+# The directory is named after the hash of the config that produced the
+# objects, so switching branch - which rewrites lv_conf and moves its mtime
+# without changing a byte - reuses what is already there instead of rebuilding
+# it, and flipping a config option back finds its old objects still present.
+LV_CONF    := lv_conf_n31.h
+# The float ABI is part of the key, not just the config: objects of the
+# two ABIs cannot be linked together, and a cache that ignored the
+# difference would hand a hard-float build its soft-float objects.
+LV_CONF_ID := $(shell md5sum $(LV_CONF) 2>/dev/null | cut -c1-12)
+LV_CACHE   ?= $(HOME)/.cache/n31-lvgl/entrain-n31-$(LV_CONF_ID)-$(FLOAT_ABI)
+# Cortex-A8, Thumb-2, hardware FP but soft-float ABI, and no NEON.
+ARCH_FLAGS := -mcpu=cortex-a5 -mthumb -mfpu=vfpv4 -mfloat-abi=$(FLOAT_ABI)
+
+CFLAGS  := -O2 -g0 -std=gnu99 $(ARCH_FLAGS) \
+           -ffunction-sections -fdata-sections \
+           -Wall -Wextra -Wno-unused-parameter
+LDFLAGS := -static -Wl,--gc-sections
+LDLIBS  := $(LIBDRM)/lib/libdrm.a -lm -lpthread
+
+LV_CFLAGS := -DLV_CONF_INCLUDE_SIMPLE -DLV_CONF_PATH=\"$(CURDIR)/lv_conf_n31.h\" \
+             -I$(LVGL_SRC) -I$(LVGL_SRC)/src -I$(LVGL_SRC)/include -I$(LVGL_SRC)/..
+TA_CFLAGS := -I$(TINYALSA)/include
+
+# libdrm's headers, for LVGL's DRM backend. On the general CFLAGS rather than
+# only the LVGL ones, because main_host.c reaches lv_linux_drm.h through
+# lvgl.h and that pulls the backend's own includes in behind it.
+CFLAGS += -I$(LIBDRM)/include
+
+CORE_SRCS := $(CORE)/osc.c $(CORE)/noise.c $(CORE)/render.c \
+             $(CORE)/program.c $(CORE)/measured.c $(CORE)/progfile.c $(CORE)/freqset.c ../../build_stamp.c $(CORE)/wavout.c
+
+# The panel and the backlight are shared with the launcher rather than
+# copied - same discovery, same sysfs handling, one place to fix them.
+SHARED    := ../../n31launcher
+CFLAGS    += -I$(SHARED)
+APP_SRCS  := main_host.c ../ui.c ../engine.c \
+             ../platform/audio_linux.c ../platform/sys_host.c \
+             $(SHARED)/touch.c $(SHARED)/backlight.c $(CORE_SRCS)
+
+# The app is compiled in one gcc invocation, so there are no object files for
+# -MMD to hang dependency files off. Without this, editing a header changed
+# nothing as far as make was concerned and the binary kept stale code.
+APP_HDRS  := $(wildcard $(CORE)/*.h ../platform/*.h ../*.h *.h)
+
+# tinyalsa is five files with no dependencies, which is exactly why it is used
+# here instead of alsa-lib: it compiles straight into the static binary.
+TA_SRCS   := $(TINYALSA)/src/pcm.c $(TINYALSA)/src/pcm_hw.c \
+             $(TINYALSA)/src/pcm_plugin.c $(TINYALSA)/src/mixer.c \
+             $(TINYALSA)/src/mixer_hw.c $(TINYALSA)/src/mixer_plugin.c \
+             $(TINYALSA)/src/snd_card_plugin.c $(TINYALSA)/src/limits.c
+
+# LVGL, minus every platform this target will never be.
+LV_SRCS := $(shell find $(LVGL_SRC)/src -name '*.c' \
+             -not -name 'lv_freertos.c' -not -name 'lv_cmsis_rtos2.c' \
+             -not -name 'lv_mqx.c'      -not -name 'lv_rtthread.c' \
+             -not -name 'lv_windows.c'  -not -name 'lv_sdl2.c' \
+             -not -path '*/drivers/nuttx/*'    -not -path '*/drivers/qnx/*' \
+             -not -path '*/drivers/uefi/*'     -not -path '*/drivers/windows/*' \
+             -not -path '*/drivers/wayland/*'  -not -path '*/drivers/x11/*' \
+             -not -path '*/drivers/libinput/*' -not -path '*/drivers/opengles/*' \
+             -not -path '*/drivers/sdl/*' \
+             2>/dev/null)
+
+LV_OBJS := $(patsubst $(LVGL_SRC)/%.c,$(LV_CACHE)/%.o,$(LV_SRCS))
+TA_OBJS := $(patsubst $(TINYALSA)/%.c,$(BUILD)/tinyalsa/%.o,$(TA_SRCS))
+
+
+# ---- build stamp -----------------------------------------------------------
+#
+# Which build is this. An app sitting on the device that is months old looks
+# exactly like the one just compiled, right up until an afternoon goes into
+# debugging something that was fixed in April.
+BUILD_STAMP := $(shell date -u +%Y%m%d.%H%M)
+BUILD_GIT   := $(shell git rev-parse --short=7 HEAD 2>/dev/null || echo nogit)
+CFLAGS += -DEN_BUILD_STAMP='"$(BUILD_STAMP)"' -DEN_BUILD_GIT='"$(BUILD_GIT)"'
+
+.PHONY: all push push-programs run run-bg log stop fbcon-off fbcon-on clean clean-app clean-lvgl toolchain-check
+
+# Stated rather than implied. Adding a rule above `all` silently makes THAT
+# what a bare `make` builds, and the failure mode is a build that reports
+# success having done nothing.
+.DEFAULT_GOAL := all
+
+all: $(BUILD)/entrain
+
+toolchain-check:
+	@test -x $(CC) || { echo "no cross gcc at $(CC)"; exit 1; }
+	@test -d $(TINYALSA)/src || { echo "no tinyalsa at $(TINYALSA)"; exit 1; }
+	@$(CC) -dumpmachine
+
+$(BUILD):
+	@mkdir -p $(BUILD)
+
+# No lv_conf prerequisite: the cache directory name already carries that
+# file's hash, so a config change selects different objects rather than
+# invalidating these by timestamp.
+$(LV_CACHE)/%.o: $(LVGL_SRC)/%.c
+	@mkdir -p $(dir $@)
+	@$(CC) $(CFLAGS) -w $(LV_CFLAGS) -c -o $@ $<
+
+$(BUILD)/tinyalsa/%.o: $(TINYALSA)/%.c
+	@mkdir -p $(dir $@)
+	@$(CC) $(CFLAGS) -w $(TA_CFLAGS) -c -o $@ $<
+
+$(LV_CACHE)/liblvgl_n31.a: $(LV_OBJS)
+	@echo "  AR  $@"
+	@$(AR) crs $@ $^
+
+# Radio+ links this path directly, so the archive stays where it has always
+# been and only the objects behind it moved. Copying ten megabytes is nothing
+# against the twelve minutes it replaces, and it keeps that build working
+# without it having to know where this one caches.
+$(BUILD)/liblvgl_n31.a: $(LV_CACHE)/liblvgl_n31.a | $(BUILD)
+	@cp -f $< $@
+
+$(BUILD)/libtinyalsa_n31.a: $(TA_OBJS)
+	@echo "  AR  $@"
+	@$(AR) crs $@ $^
+
+$(BUILD)/entrain: $(APP_SRCS) $(APP_HDRS) $(BUILD)/liblvgl_n31.a $(BUILD)/libtinyalsa_n31.a | $(BUILD)
+	$(CC) $(CFLAGS) $(LV_CFLAGS) $(TA_CFLAGS) $(LDFLAGS) -o $@ $(APP_SRCS) \
+	      $(BUILD)/liblvgl_n31.a $(BUILD)/libtinyalsa_n31.a $(LDLIBS)
+	@$(STRIP) $@
+	@# Stage where the image builder looks, every time, so an image packed
+	@# from the other repo can never be older than the last build here. See
+	@# STAGING in the app READMEs.
+	@mkdir -p $(IPOD_ROOT)
+	@cp -f $@ $(IPOD_ROOT)/entrain$(STAGE_SUFFIX)
+	@echo "  staged -> $(IPOD_ROOT)/entrain$(STAGE_SUFFIX)"
+	@echo "=== $@ ===" && ls -l $@ && file $@ 2>/dev/null || true
+
+# The key lives on a Windows-mounted path, which shows as 0777 under WSL, and
+# ssh refuses a world-readable private key. Stage a 0600 copy outside that
+# mount once, and use it from then on.
+KEY := $(HOME)/.ssh/entrain-n31-key
+
+$(KEY): $(SSH_KEY)
+	@mkdir -p $(dir $(KEY))
+	@cp $(SSH_KEY) $(KEY)
+	@chmod 600 $(KEY)
+
+SSH = ssh -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i $(KEY)
+SCP = scp -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i $(KEY)
+
+# dropbear on the device has no sftp-server, so scp cannot be used. Piping
+# through ssh needs nothing on the far side but a shell.
+push: $(BUILD)/entrain $(KEY)
+	$(SSH) $(DEVICE) 'cat > /tmp/entrain' < $(BUILD)/entrain
+	$(SSH) $(DEVICE) 'chmod +x /tmp/entrain && ls -l /tmp/entrain'
+
+# Sample user programs, so the Custom tab has something real to list.
+PROGRAM_SRC := ../../../data/Entrain/programs
+
+push-programs: $(KEY)
+	$(SSH) $(DEVICE) 'mkdir -p /tmp/entrain-data/programs'
+	@for f in $(PROGRAM_SRC)/*.txt; do \
+	    b=`basename $$f`; \
+	    echo "  $$b"; \
+	    $(SSH) $(DEVICE) "cat > /tmp/entrain-data/programs/$$b" < $$f; \
+	done
+
+# The framebuffer console (vtcon1) is bound and paints text over /dev/fb0, so
+# it has to be unbound first or it fights us for the panel. Rebound afterwards
+# so the device is left as it was found.
+fbcon-off: $(KEY)
+	-$(SSH) $(DEVICE) 'echo 0 > /sys/class/vtconsole/vtcon1/bind 2>/dev/null; true'
+
+fbcon-on: $(KEY)
+	-$(SSH) $(DEVICE) 'echo 1 > /sys/class/vtconsole/vtcon1/bind 2>/dev/null; true'
+
+# ENTRAIN_HOME keeps prefs on the writable rootfs; /mnt/disk is mounted
+# read-only. ENTRAIN_PROGRAMS is separate so it can point at that volume.
+ENV := ENTRAIN_HOME=/tmp/entrain-data ENTRAIN_PROGRAMS=/tmp/entrain-data/programs
+
+run: stop push fbcon-off
+	-$(SSH) $(DEVICE) '$(ENV) /tmp/entrain --backend fbdev --buttons $(RUNARGS)'
+	@$(MAKE) -f Makefile.n31 fbcon-on
+
+# Same, but detached with a log, which is what you want when the point is to
+# look at the screen rather than at a terminal.
+run-bg: stop push fbcon-off
+	$(SSH) $(DEVICE) 'killall entrain 2>/dev/null; sleep 1; \
+	  $(ENV) /tmp/entrain --backend fbdev --buttons $(RUNARGS) \
+	  > /tmp/entrain.log 2>&1 < /dev/null & sleep 3; cat /tmp/entrain.log'
+
+log: $(KEY)
+	-$(SSH) $(DEVICE) 'cat /tmp/entrain.log'
+
+# busybox on this initramfs has no killall or pkill on PATH, so the pid has to
+# come out of ps.
+stop: $(KEY)
+	-@$(SSH) $(DEVICE) 'for p in $$(ps | grep "[e]ntrain" | while read pid rest; do echo $$pid; done); do kill -9 $$p 2>/dev/null; done; sleep 1; true'
+
+# Only the app. The LVGL and tinyalsa archives are several minutes of
+# cross-compilation and nothing in this app has ever needed them rebuilt — use
+# this unless the toolchain itself changed.
+clean-app:
+	rm -f $(BUILD)/entrain
+
+# Leaves the LVGL cache alone, which is the point of it: `clean` should cost
+# seconds, not twelve minutes. Use clean-lvgl to drop that too.
+clean:
+	rm -rf $(BUILD)
+
+clean-lvgl:
+	rm -rf $(LV_CACHE)

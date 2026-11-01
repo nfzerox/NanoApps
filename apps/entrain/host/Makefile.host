@@ -1,0 +1,194 @@
+# Makefile.host — build Entrain's DSP and UI on a Linux desktop.
+#
+# core/ is pure C99 with no LVGL and no SDK, so it compiles here unchanged and
+# can be tested, and listened to, without an iPod attached. ui.c is the same
+# file the device builds, at the same 240x432, so the layout you tune here is
+# the layout the device renders.
+#
+#   make -f Makefile.host test     run the unit tests
+#   make -f Makefile.host wav      build the offline renderer
+#   make -f Makefile.host run      build and run the UI in a 240x432 window
+#   make -f Makefile.host shots    render every screen to shots/*.png, no display
+#
+# LVGL comes from the checkout ./start already pins for the device build, so
+# there is nothing extra to fetch. SDL2 and ALSA are both optional: without SDL
+# you still get the fbdev, DRM and headless backends; without ALSA the UI runs
+# silently. Neither absence blocks development.
+
+CC      ?= cc
+AR      ?= ar
+CORE    := ../core
+LVGL    ?= ../../../lvgl
+
+# Compile LVGL from a native mirror rather than across the Windows mount,
+# which is nineteen times faster - see apps/lvgl-mirror.mk.
+ifneq ($(filter host run shots,$(MAKECMDGOALS)),)
+include ../../lvgl-mirror.mk
+else
+LVGL_SRC := $(LVGL)
+endif
+
+BUILD   := build
+
+CORE_SRCS := $(CORE)/osc.c $(CORE)/noise.c $(CORE)/render.c \
+             $(CORE)/program.c $(CORE)/measured.c $(CORE)/progfile.c $(CORE)/freqset.c ../../build_stamp.c $(CORE)/wavout.c
+
+WARN    := -Wall -Wextra -Wshadow -Wpointer-arith
+CFLAGS  ?= -O2 -g -std=c99 $(WARN)
+LDLIBS  := -lm
+
+
+# ---- build stamp -----------------------------------------------------------
+#
+# Which build is this. An app sitting on the device that is months old looks
+# exactly like the one just compiled, right up until an afternoon goes into
+# debugging something that was fixed in April.
+BUILD_STAMP := $(shell date -u +%Y%m%d.%H%M)
+BUILD_GIT   := $(shell git rev-parse --short=7 HEAD 2>/dev/null || echo nogit)
+CFLAGS += -DEN_BUILD_STAMP='"$(BUILD_STAMP)"' -DEN_BUILD_GIT='"$(BUILD_GIT)"'
+
+.PHONY: all test glyphs wav host run shots clean clean-lvgl
+
+.DEFAULT_GOAL := test
+
+all: test
+
+$(BUILD):
+	@mkdir -p $(BUILD)
+
+# ---- unit tests ------------------------------------------------------------
+# No LVGL, no platform layer: just core/ and the assertions.
+
+$(BUILD)/tests: tests.c $(CORE_SRCS) | $(BUILD)
+	$(CC) $(CFLAGS) -Wstrict-prototypes -o $@ $^ $(LDLIBS)
+
+test: $(BUILD)/tests glyphs
+	@$(BUILD)/tests
+
+# Every user-facing string must be renderable. LVGL's Montserrat carries ASCII
+# plus a small symbol set; anything else is an empty box on screen, and an em
+# dash slipping into a settings note is exactly how that happens.
+glyphs:
+	@python3 check_glyphs.py ../ui.c ../core/program.c ../engine.c
+
+# ---- offline renderer ------------------------------------------------------
+# Render any preset or program to a .wav so it can be heard on real speakers,
+# or dropped straight onto the iPod.
+
+$(BUILD)/entrain-wav: wavtool.c $(CORE_SRCS) | $(BUILD)
+	$(CC) $(CFLAGS) -Wstrict-prototypes -o $@ $^ $(LDLIBS)
+
+wav: $(BUILD)/entrain-wav
+	@echo "built $(BUILD)/entrain-wav — try: ./$(BUILD)/entrain-wav --list"
+
+# ---- the UI ----------------------------------------------------------------
+
+HAVE_SDL  := $(shell pkg-config --exists sdl2 && echo 1)
+HAVE_ALSA := $(shell pkg-config --exists alsa && echo 1)
+HAVE_DRM  := $(shell pkg-config --exists libdrm gbm && echo 1)
+
+LV_CFLAGS := -DLV_CONF_INCLUDE_SIMPLE -DLV_CONF_PATH=\"$(CURDIR)/lv_conf_host.h\" \
+             -I$(LVGL_SRC) -I$(LVGL_SRC)/src -I$(LVGL_SRC)/include -I$(LVGL_SRC)/..
+
+# POSIX bits (usleep, gettimeofday) that -std=c99 alone hides. core/ still
+# compiles as strict C99 in the test and wav targets.
+HOST_CFLAGS := -D_DEFAULT_SOURCE
+HOST_LIBS   := -lpthread
+
+ifeq ($(HAVE_SDL),1)
+  HOST_CFLAGS += $(shell pkg-config --cflags sdl2)
+  HOST_LIBS   += $(shell pkg-config --libs sdl2)
+else
+  LV_CFLAGS += -DENTRAIN_NO_SDL
+endif
+
+ifeq ($(HAVE_ALSA),1)
+  HOST_CFLAGS += -DEN_HOST_ALSA $(shell pkg-config --cflags alsa)
+  HOST_LIBS   += $(shell pkg-config --libs alsa)
+endif
+
+ifeq ($(HAVE_DRM),1)
+  LV_CFLAGS += -DENTRAIN_HAVE_DRM $(shell pkg-config --cflags libdrm gbm)
+  HOST_LIBS += $(shell pkg-config --libs libdrm gbm)
+else
+  LV_DRM_EXCLUDE := -not -path '*/drivers/display/drm/*'
+endif
+
+# LVGL's own sources. The drivers are included — that is where SDL, fbdev, DRM
+# and evdev live — minus the platforms this build will never target.
+LV_SRCS := $(shell find $(LVGL_SRC)/src -name '*.c' \
+             -not -name 'lv_freertos.c' -not -name 'lv_cmsis_rtos2.c' \
+             -not -name 'lv_mqx.c'      -not -name 'lv_rtthread.c' \
+             -not -name 'lv_windows.c'  -not -name 'lv_sdl2.c' \
+             -not -path '*/drivers/nuttx/*'    -not -path '*/drivers/qnx/*' \
+             -not -path '*/drivers/uefi/*'     -not -path '*/drivers/windows/*' \
+             -not -path '*/drivers/wayland/*'  -not -path '*/drivers/x11/*' \
+             -not -path '*/drivers/libinput/*' -not -path '*/drivers/opengles/*' \
+             $(LV_DRM_EXCLUDE) \
+             2>/dev/null)
+
+# Objects live on the native filesystem, not the Windows drive, under a
+# directory named for what produced them.
+#
+# Two things drive this. The Windows drive costs more in filesystem time than
+# the compiler costs in CPU. And lv_conf is a tracked file, so every branch
+# switch moves its mtime without changing a byte - which used to rebuild all
+# four hundred and sixty-six objects for a file that had not changed.
+#
+# The key is the config, the host flags AND the compiler's target triple.
+# Which backends are enabled changes the objects, so the flags were always a
+# real dependency. The triple joined them after a build from Git Bash and a
+# build from WSL - which share $(HOME)/.cache through the same Windows drive -
+# hashed identically and handed each other the other's object files. The
+# symptom is a link full of undefined LVGL symbols, which reads like a missing
+# archive rather than an archive built by the wrong compiler.
+CCACHE  := $(shell command -v ccache 2>/dev/null)
+LV_KEY  := $(shell { md5sum lv_conf_host.h; echo '$(HOST_CFLAGS)';                      $(CC) -dumpmachine; }                    2>/dev/null | md5sum | cut -c1-12)
+LV_CACHE ?= $(HOME)/.cache/n31-lvgl/entrain-host-$(LV_KEY)
+
+LV_OBJS := $(patsubst $(LVGL_SRC)/%.c,$(LV_CACHE)/%.o,$(LV_SRCS))
+LVLIB   := $(LV_CACHE)/liblvgl_host.a
+
+$(LV_CACHE)/%.o: $(LVGL_SRC)/%.c
+	@mkdir -p $(dir $@)
+	@$(CCACHE) $(CC) -O2 -std=gnu99 -w $(LV_CFLAGS) $(HOST_CFLAGS) -c -o $@ $<
+
+$(LVLIB): $(LV_OBJS)
+	@echo "  AR  $@"
+	@$(AR) crs $@ $^
+
+# Kept where it has always been. Nothing links it from here any more - Radio+
+# builds its own now - but `make clean` should still take the archive with it.
+$(BUILD)/liblvgl_host.a: $(LVLIB) | $(BUILD)
+	@cp -f $< $@
+
+APP_SRCS := main_host.c ../ui.c ../engine.c \
+            ../platform/audio_host.c ../platform/sys_host.c $(CORE_SRCS)
+
+$(BUILD)/entrain-host: $(APP_SRCS) $(BUILD)/liblvgl_host.a | $(BUILD)
+	$(CC) $(CFLAGS) $(LV_CFLAGS) $(HOST_CFLAGS) -o $@ $(APP_SRCS) \
+	      $(BUILD)/liblvgl_host.a $(HOST_LIBS) $(LDLIBS)
+
+host: $(BUILD)/entrain-host
+
+run: $(BUILD)/entrain-host
+	./$(BUILD)/entrain-host
+
+# Render every screen headlessly and convert to PNG. No display, no SDL and no
+# window manager needed, which is what makes it usable over a plain shell.
+shots: $(BUILD)/entrain-host
+	@mkdir -p ../screenshots
+	@# The frequency shelf reads its bundle from ENTRAIN_DATA, which on the
+	@# device is the app's folder on the volume. Point it at the tree, or the
+	@# shot is of the shelf's empty state rather than of four hundred sets.
+	@ENTRAIN_DATA=../../../data/Entrain ./$(BUILD)/entrain-host --shot ../screenshots
+	@python3 tobmp.py ../screenshots
+	@rm -f ../screenshots/*.bmp
+
+# Leaves the LVGL cache alone, which is the point of it: `clean` should cost
+# seconds, not the better part of an hour. Use clean-lvgl to drop that too.
+clean:
+	rm -rf $(BUILD)
+
+clean-lvgl:
+	rm -rf $(LV_CACHE)

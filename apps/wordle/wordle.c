@@ -2,7 +2,7 @@
  * wordle — guess the 5-letter word in 6 tries.
  *
  * Built-in answer wordlist (~150 common 5-letter words); users can
- * drop additional wordlists at /Apps/Data/Wordle/<name>.txt (one
+ * drop additional wordlists at /Data/Wordle/<name>.txt (one
  * word per line) and they're appended to the pool.
  *
  * Grid is rendered with one lv_obj per cell — 6 rows x 5 cols = 30
@@ -21,7 +21,7 @@
 #define MAX_GUESSES   6
 #define WORD_LEN      5
 #define MAX_WORDS     800
-#define DATA_DIR      "/Apps/Data/Wordle"
+#define DATA_DIR      "/Data/Wordle"
 
 /* Built-in answer list — common safe 5-letter English words. */
 static const char *s_builtin_words[] = {
@@ -80,7 +80,7 @@ static uint32_t rnd(void) { s_rng ^= s_rng << 13; s_rng ^= s_rng >> 17; s_rng ^=
 
 static void load_custom(void)
 {
-    /* Walk /Apps/Data/Wordle/*.txt, append lines that are exactly 5 lowercase
+    /* Walk /Data/Wordle/*.txt, append lines that are exactly 5 lowercase
        letters. Heap-dup the blob so the pointers stay valid. */
     hb_dir_t d;
     if (!hb_fs_dir_open(&d, DATA_DIR, false)) return;
@@ -307,7 +307,7 @@ static void on_enter(lv_event_t *e)
 HB_APP_ENTRY(payload_entry)
 {
     hb_trace_init();
-    hb_fs_mkdir("/Apps/Data");
+    hb_fs_mkdir("/Data");
     hb_fs_mkdir(DATA_DIR);
     s_rng = hb_time_uptime_us() | 1u;
     load_words();

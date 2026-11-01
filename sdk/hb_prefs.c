@@ -2,7 +2,7 @@
  * hb_prefs — preferences, both ours and the OS's.
  *
  * Two small stores share this file: (1) our own file-backed user prefs
- * (theme / status-bar / home-button) under /Apps/Data/Settings, cached on
+ * (theme / status-bar / home-button) under /Data/Settings, cached on
  * first read so the per-frame status-bar tick doesn't re-stat disk; and
  * (2) thin read/write accessors over the OS preference-store singleton
  * (the hb_settings_* calls).
@@ -11,9 +11,9 @@
 #include "hb_sdk.h"
 #include "hb_sysfx.h"
 
-#define THEME_PATH    "/Apps/Data/Settings/theme"
-#define BAR_PATH      "/Apps/Data/Settings/status_bar"
-#define HOME_PATH     "/Apps/Data/Settings/home_button"
+#define THEME_PATH    "/Data/Settings/theme"
+#define BAR_PATH      "/Data/Settings/status_bar"
+#define HOME_PATH     "/Data/Settings/home_button"
 
 static int       s_cached       = 0;
 static uint32_t  s_tint         = HB_TINT_DEFAULT;

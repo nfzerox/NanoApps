@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>org.nanoapps.doodlejump</string>
+<key>CFBundleName</key><string>Doodle Jump</string>
+<key>CFBundleExecutable</key><string>doodlejump</string>
+<key>HBAppKind</key><integer>2</integer>
+<key>HBIconGlyph</key><string>gamepad</string>
+<key>HBIconColor</key><string>#e9dba5</string>
+</dict></plist>

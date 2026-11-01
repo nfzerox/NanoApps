@@ -4,40 +4,22 @@
 [![NanoApps Overview](screenshots/NanoApps_Overview.png)](https://www.youtube.com/watch?v=18ioMXBhhTA)
 ▶️ **[Watch NanoApps in action on YouTube.](https://www.youtube.com/watch?v=18ioMXBhhTA)**
 
-NanoApps Beta lets you [run a collection of](#included-apps), and [build your own](#contributing-to-nanoapps), homebrew apps on iPod nano 7th generation. Out of the box it includes essential utilities like Calculator, Countdown Days, Files, Paint, and Screenshots, productivity tools like Calendar, Notes, Reminders, and Books, and lightweight games like 2048, Tetris, Minesweeper, and Rhythm.
+NanoApps lets you [run a collection of](#included-apps), and [build your own](#contributing-to-nanoapps), homebrew apps on iPod nano 7th generation. Out of the box it includes essential utilities like Calculator, Countdown Days, Files, Paint, and Screenshots, productivity tools like Calendar, Notes, Reminders, and Books, and lightweight games like 2048, Tetris, Minesweeper, and Rhythm. NanoApps also adds compatibility with AirPods with H2 chip and iPhone Lightning Dock.
 
 Homebrew apps appear as colorful icons on the native nano Home Screen, render with the full LVGL widget toolkit, and launch with the familiar zoom animation, so they feel at home next to Music and Photos. Games and visualization apps can also use OpenGL ES for 3D rendering. Contributions are very welcome: see [Contributing to NanoApps](#contributing-to-nanoapps), join the [NanoApps Discord](https://discord.gg/Er3KJwaCMg), and share what you build on [r/ipod](https://www.reddit.com/r/ipod/).
 
-## Getting Started
+Includes community work from [nano7-untethered](https://github.com/olievans123/nano7-untethered), [andrew867’s NanoApps](https://github.com/andrew867/NanoApps), [NanoBtFix](https://github.com/Merquice/NanoBtFix), [nano7-a1717-dock](https://github.com/Raphmatt/nano7-a1717-dock), and [ipod_sun](https://github.com/ninjaprawn/ipod_sun).
 
-You need:
+## Download and Install NanoApps
 
-- [iPod nano 7th generation](https://www.backmarket.com/en-us/search?q=iPod+nano+7)
-- A [Linux computer](https://www.debian.org) (such as a [Raspberry Pi](https://www.raspberrypi.com)) to connect the iPod to
-
-NanoApps depends on ipod_sun_untethered. On a Windows PC, visit the [ipod_sun_untethered releases page](https://github.com/nfzerox/ipod_sun_untethered/releases), download the IPSW for your iPod nano 7 model, and restore it with [iTunes](https://www.apple.com/itunes/). Mac-formatted iPods can work, but writing to an HFS formatted iPod from Linux/Raspberry Pi is experimental.
-
-The SCSI command channel installed by ipod_sun_untethered can cause the iPod to repeatedly reboot when connected to iTunes, Apple Devices, or Finder. After restoring, disconnect the iPod from your Windows PC or Mac, and connect it to your Raspberry Pi or a Linux machine. 
-
-To sync music, put your iPod in Disk Mode: Connect iPod to Windows PC or Mac. Press and hold both Home and power button. When the screen goes dark, but before the Apple logo shows up, immediately release Home and power, then press and hold volume up and volume down. iPod should enter Disk mode with "OK to disconnect" on screen, letting you sync music. After you're done, press and hold both Home and power button to reboot. When installing homebrew apps, connect iPod nano to your Linux machine instead.
-
-On your Linux computer, open Terminal, then paste and run these commands:
-
-```sh
-git clone https://github.com/nfzerox/NanoApps.git
-cd NanoApps
-./start
-```
-
-The first time you run it, `./start` asks where the iPod is attached and sets everything up for you, installing anything that is missing. Then choose **Install all apps** from the menu.
-
-> **Note:** the very first build is slow — LVGL has to compile from scratch, which can take a few minutes (longer on a Raspberry Pi). This is normal and only happens once; later builds reuse the cached result and are much faster.
-
-When an install finishes, give the iPod a moment to reach the Home Screen, then open any built-in app like Music, and head back Home. Homebrew apps will appear, each as its own colorful icon, with native support for jiggle mode and launch animation.
+1. Download [NanoApps-2012-Model.ipsw](https://github.com/nfzerox/NanoApps/releases/latest/download/NanoApps-2012-Model.ipsw) or [NanoApps-2015-Model.ipsw](https://github.com/nfzerox/NanoApps/releases/latest/download/NanoApps-2015-Model.ipsw) for your iPod nano.
+2. Connect the iPod and select it in Finder, iTunes, or Apple Devices. Hold Option on Mac or Shift on Windows while clicking Check for Update, then select the downloaded IPSW.
+3. Download [NanoApps-disk.zip](https://github.com/nfzerox/NanoApps/releases/latest/download/NanoApps-disk.zip). Unzip it, and copy all three folders ("Apps", "Data", and "Library") to the top level of the iPod's disk in Finder or File Explorer.
+4. Eject the iPod. Homebrew apps will appear automatically on the Home Screen.
 
 ![Home Screen with NanoApps across multiple iPod nano colors](screenshots/NanoApps_Home.png)
 
-Homebrew apps need be re-registered each time the iPod restarts. To re-register homebrew apps, run `./NanoApps/start` again in Terminal and choose **Install resident only**. The menu has everything else too: install a single app, add sample data, and repair the iPod's disk if an install ever hits a read-only error.
+To add an app shared by another developer, unzip its app ZIP and copy the `.nanoapp` folder into the Apps folder on the iPod.
 
 ## Included Apps
 
@@ -114,15 +96,33 @@ NanoApps ships with a broad collection of apps and games: productivity and refer
 - **[Stress](apps/stress/stress.c)**: LVGL's stress test.
 - **[Widgets](apps/widgets/widgets.c)**: LVGL's widget gallery demo.
 
+## Build and Install NanoApps Yourself
+
+On your Mac or Linux computer, open Terminal, then paste and run these commands:
+
+```sh
+git clone https://github.com/nfzerox/NanoApps.git
+cd NanoApps
+./start
+```
+
+The first time you run it, `./start` finds the iPod and sets everything up for you, installing anything that is missing. Choose **Install all apps** from the menu.
+
+> **Note:** the very first build is slow. LVGL has to compile from scratch, which can take a few minutes. This is normal and only happens once; later builds reuse the cached result and are much faster.
+
+The installer restarts the iPod when finished. Homebrew apps will appear automatically on the Home Screen, each as its own colorful icon, with native support for jiggle mode and launch animation.
+
+The menu has everything else too: install a single app, add sample data, and repair the iPod's disk if an install ever hits a read-only error.
+
 ## Developing Apps
 
 NanoApps gives you a small C SDK ([`sdk/hb_sdk.h`](sdk/hb_sdk.h)) covering [display](sdk/hb_raw_surface.c), [multitouch](sdk/hb_surface_input.c), [buttons](sdk/hb_button.c), [accelerometer](sdk/hb_accel.c), [battery](sdk/hb_battery.c), [brightness](sdk/hb_brightness.c), [clock](sdk/hb_rtc.c), [filesystem](sdk/hb_fs.c), [audio](sdk/hb_audio.c), and the native UI integration ([home screen icons](sdk/hb_silver_icon.c), [screen surfaces](sdk/hb_lv_surface.c), [screenshots](sdk/hb_screenshot.c), [screen recording](sdk/hb_record.c)). Apps come in three surface kinds: [LVGL widgets](sdk/hb_lv_surface.c) (software-rendered), [OpenGL ES 1.1](sdk/gl.c) (GPU-accelerated 3D), and a [direct-framebuffer mode](sdk/hb_raw_surface.c) for fast immediate-mode drawing.
 
 ### How `./start` works
 
-`./start` is the single entry point for everything: building, installing, scaffolding new apps, pulling screenshots, and repairing the disk. It auto-detects whether the iPod is attached to this computer or to a remote Linux computer over SSH, and runs every device operation through the right transport, so the same command works either way. It finds the iPod's disk automatically by its SCSI model, so you never need to know the device node or give the volume a particular name.
+`./start` is the single entry point for everything: building, installing, scaffolding new apps, pulling screenshots, and repairing the disk. It connects directly to the iPod over USB on macOS and Linux. It finds the iPod's disk automatically by its SCSI model, so you never need to know the device node or give the volume a particular name.
 
-On first use it asks where the iPod is attached and remembers the answer (re-run `./start setup` to change it), then installs anything missing, including the ARM toolchain, Python with Pillow, the Rust toolchain, the pinned LVGL checkout, Font Awesome, and the SCSI and FAT tools on the iPod's computer.
+On first use it installs anything missing, including the ARM toolchain, Python with Pillow, the Rust toolchain, the pinned LVGL checkout, Font Awesome, the firmware builder, and the USB and filesystem tools.
 
 Build everything without touching the device with `./start build`, and run `./start` with no arguments for the interactive menu.
 
@@ -146,7 +146,13 @@ Build everything without touching the device with `./start build`, and run `./st
 
 ### How apps are built
 
-Every app is a self-contained, position-independent `.hbapp` blob plus an `Info.plist` that carries its identity (bundle id, display name, icon glyph and color). At install time the apps are packed into `/Apps/AllApps.pack` with their executables under `/Apps/Executables/` and icons under `/Apps/Icons/`; the resident registers them on the Home Screen and launches them on tap, handing each app a framebuffer surface to render into. Nothing of ours is written outside `/Apps`.
+Every app is a self-contained, position-independent `.hbapp` blob plus an `Info.plist` that carries its identity (bundle id, display name, icon glyph and color). The resident registers apps on the Home Screen and launches them on tap, handing each app a framebuffer surface to render into. App files stay under `/Apps`, app data under `/Data`, and runtime files under `/Library`.
+
+Build a ZIP that anyone can install independently, without adding it to this repository or rebuilding other apps:
+
+```sh
+./start package my_app             # produces build/packages/my_app.zip
+```
 
 An app's `Makefile` picks the surface kind:
 
@@ -184,7 +190,7 @@ hb_trace_log("BOOT", 0, 0);
 hb_trace_log("STEP", 1, 0);
 ```
 
-Print the most recent trace entries (the iPod only needs to be attached to its Linux computer, in any mode):
+Print the most recent trace entries (the iPod only needs to be attached to your computer):
 
 ```sh
 ./start trace
@@ -225,7 +231,6 @@ Good places to start:
 - Improve the [homebrew apps](apps) and its LVGL integration.
 - Reverse engineer more OS APIs for the [homebrew SDK](sdk/hb_sdk.h) and improve SDK reliability.
 - Bring more to the [OpenGL ES](apps/opengl/opengl.c) path: 3D games and visualizations.
-- Build more user-friendly installation methods, such as untethered injection.
-- Add Windows and Mac development and install support in addition to Linux.
+- Add Windows development and install support.
 
 [Pull requests](https://github.com/nfzerox/NanoApps/pulls) are welcome. Fork it, play with it, and discuss with fellow hackers on the [NanoApps Discord](https://discord.gg/Er3KJwaCMg). If you make something cool, post it, share it on [r/ipod](https://www.reddit.com/r/ipod/) and social media.

@@ -1,6 +1,6 @@
 /*
  * benchmark — runs LVGL's lv_demo_benchmark on the relocatable surface runtime,
- * and writes the per-scene results to /Apps/Data/Bench/bench_*.csv so they can be
+ * and writes the per-scene results to /Data/Bench/bench_*.csv so they can be
  * pulled off the device and compared across rendering changes (e.g. an GPU-2D /
  * hardware-accelerated draw backend later).
  *
@@ -28,9 +28,9 @@ static void on_benchmark_end(const lv_demo_benchmark_summary_t *s)
     const lv_demo_benchmark_scene_dsc_t *sc;
 
     hb_rtc_read(&t);
-    hb_fs_mkdir("/Apps/Data/Bench");   /* mkdir -p; no-op if it already exists */
+    hb_fs_mkdir("/Data/Bench");   /* mkdir -p; no-op if it already exists */
     lv_snprintf(path, sizeof path,
-                "/Apps/Data/Bench/bench_%04u%02u%02u_%02u%02u%02u.csv",
+                "/Data/Bench/bench_%04u%02u%02u_%02u%02u%02u.csv",
                 (unsigned)t.year, (unsigned)t.month, (unsigned)t.day_of_month,
                 (unsigned)t.hours, (unsigned)t.minutes, (unsigned)t.seconds);
 

@@ -102,6 +102,10 @@ void hb_draw_char(int16_t x, int16_t y, char c, uint8_t scale,
 void hb_draw_str(int16_t x, int16_t y, const char *s, uint8_t scale,
                  hb_color_t fg, hb_color_t bg);
 
+/* The 8 row bytes (MSB = leftmost pixel) of a glyph, for apps that draw text
+   into their own framebuffer (raw surface apps). */
+const uint8_t *hb_font8x8_glyph(char c);
+
 /* ---- Buttons (hb_button.c) ---- */
 
 /* Available buttons on N7G.
@@ -202,6 +206,9 @@ bool hb_fs_stream_close(void);
 /* Read up to `max_size` bytes from `path` into `buf`. Returns the
    number of bytes actually read (0 if file is missing or read failed). */
 uint32_t hb_fs_read(const char *path, void *buf, uint32_t max_size);
+/* Explicit read-only volume access (0 = disk, 4 = firmware resources). */
+uint32_t hb_fs_read_at(const char *path, void *buf, uint32_t max_size, int volume);
+uint32_t hb_fs_size_at(const char *path, int volume);
 
 /* Directory iteration. Opaque storage; pass the same hb_dir_t through
    open / next / close. Caller owns the buffer.
@@ -250,7 +257,7 @@ bool hb_fs_is_dir(const char *path);
 bool hb_fs_rmdir(const char *path);
 
 /* Recursive remove — file OR directory. Returns true on full success.
-   Use for cleaning up app data folders, /Apps/Foo.app etc. */
+   Use for cleaning up app data folders, /Apps/Foo.nanoapp etc. */
 bool hb_fs_rmrf(const char *path);
 
 /* Smart unlink — works on either files or empty dirs (uses
@@ -370,6 +377,44 @@ void    hb_settings_set_backlight_timer(int32_t seconds);
 uint32_t hb_time_uptime_us(void);
 uint32_t hb_time_uptime_ms(void);
 
+/* ---- Lazy VFP/NEON task context (hb_fpu.c) ----
+
+   retailos uses a per-task floating-point save area and lazy-FPU handler. This
+   reuses the current task's native context when one already exists, or attaches
+   the same 148-byte layout used by native FP tasks when it is absent. Apple's
+   handler remains responsible for enabling FPEXC and saving/restoring state.
+
+   Firmware-specific to nano 7G retailos 1.1.2 (39A10023). The allocated
+   148-byte context intentionally lives for the task's lifetime. Call once (it
+   is idempotent), before the first compiler-generated or inline FP instruction.
+
+   Hardware tests show that ARM-state VFPv3 works but Thumb-state VFP traps in
+   this firmware's undefined-instruction path. Apple's switcher saves d0-d15
+   only. Compile FP code with:
+       -marm -mfloat-abi=softfp -mfpu=vfpv3-d16
+   Keep Thumb code at -mfloat-abi=soft, and do not let app code use d16-d31 /
+   q8-q15. */
+typedef struct {
+    uint32_t cpsr;
+    uint32_t task;
+    uint32_t previous_context;
+    uint32_t context;
+    uint32_t previous_enabled;
+    uint32_t enabled;
+    uint32_t owner_before;
+} hb_fpu_status_t;
+
+#define HB_FPU_ATTACH_EXISTING       1
+#define HB_FPU_ATTACH_NEW            2
+#define HB_FPU_ATTACH_NO_TASK       -1
+#define HB_FPU_ATTACH_NO_MEMORY     -2
+#define HB_FPU_ATTACH_BAD_ALIGNMENT -3
+
+int hb_fpu_attach_current_task(hb_fpu_status_t *status);
+
+/* Current owner recorded by Apple's lazy-FPU handler. Diagnostic only. */
+uint32_t hb_fpu_owner_task(void);
+
 /* ---- I-cache maintenance (hb_reloc.c) ----
 
    Invalidate the instruction cache for [addr, addr + size). Call this
@@ -419,20 +464,32 @@ void hb_accel_read_milli_g(int32_t out_xyz[3]);
 
 /* ---- Crash-log trace channel (hb_trace.c) ----
 
-   RAM at 0x09100C00 survives N7G's kernel-panic + reboot cycle.
-   Use this to leave breadcrumbs from apps that might crash; after the
-   reboot, host reads the buffer via SCSI (`tools/dump_trace.sh`) to
-   see what we did last.
+   DRAM survives N7G's kernel-panic + reboot cycle. The resident owns a
+   ring inside its heap-loaded image; apps' hb_trace_log forwards there
+   (via hb_shared). On the next boot the resident finds the previous
+   ring by scanning DRAM and saves it to /Library/lasttrace.bin.
 
-   Usage:
-     hb_trace_init();                  // claim buffer if not magic-stamped
+   Usage (any image):
      hb_trace_log("BOOT",   0,  0);    // breadcrumb at any point
      hb_trace_log("OP_NEW", buf_addr, size);
-     hb_trace_log("CTOR",   ret_addr, 0);
      // if we crash anywhere here, the trace tells us where */
+#define HB_TRACE_BYTES   (16u + 16u * 256u)   /* header + 256 entries        */
+/* The ring always lives in the OS heap (0x08d184b8 up to ~11 MB below the top
+   of RAM, where the reserved pools start), so only that range is searched. */
+#define HB_TRACE_SCAN_LO 0x08D00000u
+#define HB_TRACE_SCAN_HI 0x09600000u
 void hb_trace_init(void);
 void hb_trace_reset(void);
 void hb_trace_log(const char *tag, uint32_t v1, uint32_t v2);
+/* Resident only: own the ring at `ring` (HB_TRACE_BYTES, 16-byte aligned)
+   and stamp it with boot sequence `seq`. */
+void hb_trace_attach(void *ring, uint32_t seq);
+/* Resident only: find the newest valid prior ring in DRAM (NULL if none),
+ * excluding the currently loaded image; *out_seq gets its boot sequence.
+ * exclude_base/span may be zero for callers that do not know their arena. */
+const void *hb_trace_find_previous(uint32_t *out_seq,
+                                   const void *exclude_base,
+                                   uint32_t exclude_span);
 
 /* ---- Image / bitmap (hb_image.c) ----
 

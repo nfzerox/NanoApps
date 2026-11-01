@@ -1,71 +1,41 @@
 #!/usr/bin/env python3
-"""start — the entry point for NanoApps: build, install, and debug homebrew
-apps on the iPod nano 7g.
+"""NanoApps: build and install independent apps for nano 7G firmware 1.1.2.
 
-Run `./start` from the repo root. With no arguments it opens an interactive
-menu; otherwise use a subcommand (below). On a fresh checkout it sets itself up
-for you: it asks where the iPod is attached and remembers the answer, then
-auto-installs anything missing (ARM toolchain, Python + Pillow, the pinned LVGL
-checkout, Font Awesome, sg3-utils) before the first build — so the usual first
-run is just `./start install`.
+Direct macOS USB transport uses IOKit and diskutil. Local Linux uses sg_raw.
+No second computer or SSH dependency is needed. Firmware tools live in firmware/.
 
-The iPod is driven over a custom SCSI channel, which needs a Linux computer:
+  start build [apps...]       compile only (no device writes)
+  start package APP           build a standalone, copy-to-iPod app ZIP
+  start install [apps...]     merge apps into the on-device catalog
+  start firmware build --revision 2012|2015   build, never flash
+  start new NAME              scaffold an app
+  start run HARNESS           build and execute a one-off SCSI harness
+  start deps [--check]        inspect or install build prerequisites
+  start peek ADDR [SIZE]      read memory through C6/98
+  start trace [COUNT]         read the heap resident's trace ring
+  start pull [media|bench]    copy captures from the device
+  start remount|eject|fsck    device filesystem operations
+  start reboot                restart over C6/98 and verify automatic app loading
 
-  * the iPod is attached to THIS computer (Linux, such as a Raspberry Pi)
-    -> commands run sg_raw locally; or
-  * you work on a Mac and the iPod hangs off a remote Linux computer (such as a
-    Raspberry Pi) -> commands run sg_raw over SSH.
-
-Which one is configured per user (no hardcoded host): a directly-attached iPod
-is auto-detected, otherwise the first device command prompts and saves the
-choice (re-run `start setup` to change it). Override per run with --local,
---remote user@host, or $REMOTE. Every device op — build, disk install, SCSI
-upload + exec, peek/trace/pull — goes through one transport, so the same command
-works either way; the iPod's Linux computer needs only sg3-utils + a mount
-point (no repo checkout there).
-
-Commands (all also runnable interactively via `start` with no args -> wizard):
-
-  start deps                  discover + install every dependency (works on
-                             apt/dnf/pacman/zypper + brew) AND clone stock upstream
-                             LVGL at the pinned commit, so a fresh machine is ready
-                             to build + install (--check = report only, don't install).
-                             Build/install also auto-install anything missing first.
-  start setup                 (re)configure where the iPod is attached
-  start new <name>            scaffold a new app by cloning the closest template of
-                             a kind (--kind lvgl|gl|raw) under a new name + identity
-  start install [targets...]  build resident + apps, pack, write to disk, exec,
-                             eject. With no targets installs everything; an APP
-                             target installs just it (+resident); a HARNESS/system
-                             target is built + exec'd once over SCSI.
-                             (--demo-data also copies data/ -> /Apps/Data,
-                              skip-existing; --demo-data-force overwrites on-device;
-                              --resident-only re-execs just the resident, no app compile)
-  start run <target>          build one target + run it once over SCSI
-  start pull [media|bench]    mount the iPod's FAT disk and pull files: `media`
-                             grabs screenshots + recordings, converts them
-                             (Pillow + recsplit), encodes the recordings to video
-                             (GIF + H.264 MP4 by default; --prores adds ProRes 4444,
-                             --lossless adds qtrle; --fps N, --force), and clears them
-                             from the device. ffmpeg is installed on first use if
-                             missing (decline = keep the frames, skip encoding).
-                             `bench` grabs the benchmark CSVs into bench_results/
-  start eject                 leave Connected mode so the iPod mounts its FS / home
-  start remount               put the iPod in Connected mode + mount its disk read-write
-  start fsck                  repair the iPod's FAT filesystem (fixes a read-only
-                             disk left by a panic / unclean eject)
-  start peek <addr> [n]       dump n bytes of iPod DRAM (default 0x200) as hex
-  start trace [n]             print the last n resident trace entries
-  start build [targets...]    build only (no device)
-  start wizard                interactive menu
-
-Targets resolve across apps/ system/ harnesses/. `start` with no args == wizard.
+With no subcommand, open the interactive menu. --help lists all options.
 """
 import argparse, os, platform, re, shutil, struct, subprocess, sys, tempfile, time
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent / "tools"))
+from macos_transport import MacDevice, devices as mac_devices
+from app_install import install as install_app_files
+from runtime_compat import ABI as RUNTIME_ABI
 
-ROOT = Path(__file__).resolve().parent   # the repo root (this script lives there)
-TRACE_RING = 0x09120000
+ROOT = Path(__file__).resolve().parent
+VENV = ROOT / ".venv"
+if (VENV / "bin/python").exists() and Path(sys.prefix) != VENV:
+    os.environ["PATH"] = str(VENV / "bin") + os.pathsep + os.environ.get("PATH", "")
+    os.execv(str(VENV / "bin/python"), [str(VENV / "bin/python"), str(ROOT / "start"), *sys.argv[1:]])
+for candidate in (Path.home() / ".cargo/bin", Path("/opt/homebrew/opt/rustup/bin")):
+    if (candidate / "cargo").exists():
+        os.environ["PATH"] = str(candidate) + os.pathsep + os.environ.get("PATH", "")
+        break
+SCSI_GROUP = "98"
 TRACE_MAGIC = 0x48425452  # 'RTBH'
 
 # Per-user transport config (NO hardcoded host). First device op prompts for
@@ -213,7 +183,7 @@ def _pip_install(pkg):
     environment (PEP 668) pip refuses --user, so auto-retry with
     --break-system-packages — but only when pip actually asks for it, so we never
     pass that flag to an older pip (<23.0.1) that wouldn't recognise it."""
-    base = [sys.executable, "-m", "pip", "install", "--user", pkg]
+    base = [sys.executable, "-m", "pip", "install", *(["--user"] if sys.prefix == sys.base_prefix else []), pkg]
     print("    $ " + " ".join(base))
     try:
         r = subprocess.run(base, capture_output=True, text=True)
@@ -370,6 +340,14 @@ def ensure_build_deps():
 
 
 def ensure_device_deps(tr):
+    if getattr(tr, "darwin", False):
+        if not _ensure_ipod_sg_raw():
+            sys.exit("start: could not build tools/macos/ipod_sg_raw (run: xcode-select --install)")
+        return
+    return _ensure_device_deps_linux(tr)
+
+
+def _ensure_device_deps_linux(tr):
     """Best-effort auto-install of the iPod-machine's SCSI/FAT tools before a deploy
     needs them. One batched, sbin-aware presence probe (non-login SSH PATH omits
     /sbin), so it's a single round-trip and silent + fast when all present. Skips
@@ -398,6 +376,28 @@ def ensure_device_deps(tr):
 
 
 # ---------------------------------------------------------------- transport ---
+# macOS: there is no sg_raw, but macOS publishes Apple's SCSITaskUserClient on every
+# iPod (com_apple_driver_iPodSBCNub, category "iPodUserClientDevice" — the channel
+# iTunes/Finder use). tools/macos/ipod_sg_raw.c drives it with sg_raw's CLI, and
+# diskutil covers mount / eject / repair, none of it needing root.
+SGRAW_SRC = ROOT / "tools" / "macos" / "ipod_sg_raw.c"
+SGRAW_BIN = ROOT / "tools" / "macos" / "ipod_sg_raw"
+
+
+def _ensure_ipod_sg_raw(build=True):
+    """Build tools/macos/ipod_sg_raw from the .c next to it on first use (needs the
+    Xcode Command Line Tools' clang). True when the binary is present + current."""
+    if SGRAW_BIN.is_file() and SGRAW_BIN.stat().st_mtime >= SGRAW_SRC.stat().st_mtime:
+        return True
+    if not build:
+        return False
+    print("    -> building tools/macos/ipod_sg_raw")
+    r = subprocess.run(["xcrun", "clang", "-O2", "-Wno-deprecated-declarations",
+                        "-framework", "IOKit", "-framework", "CoreFoundation",
+                        "-o", str(SGRAW_BIN), str(SGRAW_SRC)])
+    return r.returncode == 0 and SGRAW_BIN.is_file()
+
+
 class Transport:
     """Runs shell commands either locally or on a remote Linux computer over SSH, and knows how
     to resolve the iPod's (unstable) block node by SCSI model."""
@@ -406,6 +406,8 @@ class Transport:
         self.mode = mode            # "local" | "ssh"
         self.pi = pi                # user@host when mode == "ssh", else None
         self._dev = os.environ.get("IPOD_DEV")
+        self.darwin = mode == "local" and platform.system() == "Darwin"
+        self._mac = None
 
     @property
     def desc(self):
@@ -420,20 +422,40 @@ class Transport:
         return subprocess.run(full, check=check)
 
     def dev(self):
+        if self.darwin:
+            return self.mac.disk
         if not self._dev:
             out = self.sh(r"""lsblk -dno NAME,MODEL 2>/dev/null | awk 'tolower($0) ~ /ipod/ {print "/dev/"$1; exit}'""",
                           capture=True).strip()
-            self._dev = out or "/dev/sda"
+            if not out:
+                sys.exit("start: no unambiguous iPod disk found; set IPOD_DEV explicitly")
+            self._dev = out
         return self._dev
 
+    @property
+    def mac(self):
+        if self._mac is None:
+            if not _ensure_ipod_sg_raw():
+                raise RuntimeError("could not build the macOS SCSI transport")
+            self._mac = MacDevice(ROOT, self._dev)
+        return self._mac
+
+    def part(self):
+        return self.mac.part if self.darwin else self.dev() + "1"
+
+    def mnt(self):
+        return str(self.mac.mount()) if self.darwin else os.environ.get("IPOD_MOUNT", "/mnt/nanoapps-ipod")
+
     def peek(self, addr, n=0x200):
-        """Return n bytes of iPod DRAM via the custom SCSI peek (c6 96 02).
+        """Return n bytes of iPod DRAM via the custom SCSI peek (c6 {SCSI_GROUP} 02).
 
         the iPod only needs to be attached to its Linux computer — ANY mode, including the
         normal home screen; it does NOT need to be in Connected/disk mode. A read
         does occasionally come back all-zero before the device settles, so retry
         each 512-byte chunk and take the first result that has a non-zero byte
         (genuinely-zero memory falls through after the retries)."""
+        if self.darwin:
+            return self.mac.peek(addr, n)
         import base64
         dev = self.dev()
         out = bytearray()
@@ -441,9 +463,9 @@ class Transport:
             a = addr + off
             ab = " ".join(f"{(a >> s) & 0xff:02x}" for s in (24, 16, 8, 0))
             cmd = (f"for i in $(seq 1 8); do "
-                   f"sudo sg_raw -o /tmp/nano_peek.bin -r 512 {dev} c6 96 02 {ab} >/dev/null 2>&1 "
+                   f"sudo sg_raw -o /tmp/nano_peek.bin -r 512 {dev} c6 {SCSI_GROUP} 02 {ab} >/dev/null 2>&1 "
                    f"&& od -An -t x1 /tmp/nano_peek.bin | tr -d ' \\n' | grep -qv '^0*$' && break; "
-                   f"sleep 0.3; done; base64 /tmp/nano_peek.bin 2>/dev/null")
+                   f"sleep 0.3; done; base64 < /tmp/nano_peek.bin 2>/dev/null")
             b64 = self.sh(cmd, capture=True).strip()
             try:
                 chunk = base64.b64decode(b64)
@@ -463,10 +485,12 @@ class Transport:
         every file matching `globs` (shell globs relative to the mount root) into
         PULL_TMP on the device host, unmount. Returns the file count, or -1 if the
         mount failed."""
-        dev = self.dev(); part = dev + "1"
+        if self.darwin:
+            return self.mac.pull(globs, self.PULL_TMP)
+        dev = self.dev(); part = self.part()
         cps = "; ".join(f'cp {g} "$T"/ 2>/dev/null || true' for g in globs)
         script = (
-            f'set -u; dev={dev}; part={part}; mnt=/mnt/nanoapps-ipod; T={self.PULL_TMP}; '
+            f'set -u; dev={dev}; part={part}; mnt={self.mnt()}; T={self.PULL_TMP}; '
             f'sudo sg_start "$dev" --loej 2>/dev/null || true; '
             f'for i in $(seq 1 30); do test -e "$part" && break; sleep 1; done; '
             f'sudo fsck.vfat -a "$part" >/dev/null 2>&1 || true; '
@@ -497,10 +521,12 @@ class Transport:
     def _clear_device(self, globs):
         """Remount rw and delete files matching `globs`, then eject. Only call once
         the originals are safely copied to the host."""
-        dev = self.dev(); part = dev + "1"
+        if self.darwin:
+            return self.mac.clear(globs)
+        dev = self.dev(); part = self.part()
         rms = "; ".join(f'sudo rm -f {g} 2>/dev/null || true' for g in globs)
         script = (
-            f'set -u; dev={dev}; part={part}; mnt=/mnt/nanoapps-ipod; '
+            f'set -u; dev={dev}; part={part}; mnt={self.mnt()}; '
             f'sudo umount "$part" 2>/dev/null || true; '
             f'sudo mount -o rw,flush "$part" "$mnt" 2>/dev/null || {{ echo RW_FAILED; exit 1; }}; '
             f'cd "$mnt"; {rms}; sync; sudo umount "$mnt" 2>/dev/null || true; '
@@ -508,16 +534,92 @@ class Transport:
             f'echo CLEARED')
         return "CLEARED" in self.sh(script, capture=True)
 
-    # ---- payload upload + exec over the custom SCSI channel (c6 96 ..) --------
+    # ---- payload upload + exec over the custom SCSI channel (c6 {SCSI_GROUP} ..) --------
     # These run sudo sg_raw on the device host (local or over SSH) exactly like
     # peek(), so NOTHING needs the repo checked out on the iPod.s Linux computer anymore.
     def eject(self):
         """Leave Connected mode so the iPod mounts its filesystem / reaches home."""
+        if self.darwin:
+            return self.mac.eject()
         self.sh(f"sudo eject {self.dev()} 2>/dev/null || true", check=False)
+
+    def peek_ejected(self, address, size):
+        return self.mac.peek_ejected(address, size) if self.darwin else self.peek(address, size)
+
+    def _unmount_for_restart(self):
+        if self.darwin:
+            self.mac.unmount()
+        else:
+            import shlex
+            part = shlex.quote(self.part())
+            self.sh(f"set -e\nif findmnt -rn -S {part} >/dev/null; then\n"
+                    f"sudo umount {part}\nfi")
+
+    def finish_restart(self):
+        # Releasing a diagnostic IOKit client can let Finder reconnect media.
+        # All host files are already unmounted; leave the nano at Home again.
+        if self.darwin:
+            for disk, part in mac_devices():
+                if part.get('VolumeUUID') == self._reboot_uuid:
+                    MacDevice(ROOT, '/dev/' + disk['DeviceIdentifier']).unmount()
+            subprocess.run([str(SGRAW_BIN), 'auto', '1b', '00', '00', '00', '02', '00'], check=True)
+        else:
+            self.eject()
+
+    def prepare_restart(self):
+        """Commit USB disk changes before reset; preserve the selected UUID."""
+        if self.mode != "local":
+            raise RuntimeError("restart requires a directly attached Mac or Linux host")
+        subprocess.run(["sync"], check=True)
+        self._reboot_uuid = self.mac.uuid if self.darwin else subprocess.check_output(
+            ["lsblk", "-no", "UUID", self.part()], text=True).strip()
+        if not self._reboot_uuid:
+            raise RuntimeError("iPod volume has no stable UUID")
+        self._unmount_for_restart()
+        # Host unmount alone can leave the nano's filesystem view stale. Give
+        # media back once so it commits the new resident before watchdog reset.
+        self.eject()
+        if self.darwin:
+            self._mac = MacDevice(ROOT)  # standard START STOP UNIT loads media
+            if self._mac.uuid != self._reboot_uuid:
+                raise RuntimeError("iPod volume identity changed before restart")
+            self._dev = self._mac.disk
+        elif not self.wait_connected() or not self.reconnect_after_restart():
+            raise RuntimeError("iPod volume did not return before restart")
+        self._unmount_for_restart()
+
+    def reconnect_after_restart(self):
+        """Resolve the same volume again; never reuse a pre-reset disk node."""
+        if self.darwin:
+            choices = [(d, p) for d, p in mac_devices()
+                       if p.get("VolumeUUID") == self._reboot_uuid]
+            if len(choices) != 1:
+                return False
+            self._dev = "/dev/" + choices[0][0]["DeviceIdentifier"]
+            self._mac = MacDevice(ROOT, self._dev)
+        else:
+            rows = subprocess.check_output(["lsblk", "-rno", "PATH,UUID"], text=True)
+            parts = [row.split()[0] for row in rows.splitlines()
+                     if len(row.split()) == 2 and row.split()[1] == self._reboot_uuid]
+            if len(parts) != 1:
+                return False
+            parent = subprocess.check_output(
+                ["lsblk", "-no", "PKNAME", parts[0]], text=True).strip()
+            if not parent or "\n" in parent:
+                return False
+            self._dev = "/dev/" + parent
+        return True
+
+    def restart(self, expected_version=None):
+        from device_reboot import restart
+        return restart(self, expected_version=expected_version)
 
     def wait_connected(self):
         """Kick the iPod into Connected (mass-storage) mode and wait for the node
         to appear (a prior deploy leaves it ejected)."""
+        if self.darwin:
+            self.mac.mount()
+            return True
         dev = self.dev()
         self.sh(f"sudo sg_start {dev} --loej 2>/dev/null || true", check=False)
         return self.sh(f"for i in $(seq 1 40); do test -e {dev} && exit 0; sleep 2; done; exit 1",
@@ -534,8 +636,10 @@ class Transport:
 
     def scsi_write_file(self, local_bin, addr):
         """Upload a local file into iPod DRAM at `addr` in 512-byte chunks via the
-        custom write command (c6 96 01). The bytes are shuttled to the device host
+        custom write command (c6 {SCSI_GROUP} 01). The bytes are shuttled to the device host
         first (a no-op when local), then a self-contained loop drives sg_raw."""
+        if self.darwin:
+            return self.mac.write(local_bin, addr)
         dev = self.dev()
         remote = local_bin if self.mode == "local" else "/tmp/nano_payload.bin"
         if self.mode != "local":
@@ -550,20 +654,27 @@ class Transport:
             f'  dd if="$P" of="$C" bs=$CH count=1 skip=$i 2>/dev/null; '
             f'  cur=$(( A + i*CH )); '
             f'  ab=$(printf "%02x %02x %02x %02x" $(((cur>>24)&255)) $(((cur>>16)&255)) $(((cur>>8)&255)) $((cur&255))); '
-            f'  sudo sg_raw -s $CH -i "$C" "$DEV" c6 96 01 $ab >/dev/null 2>&1; '
+            f'  sudo sg_raw -s $CH -i "$C" "$DEV" c6 {SCSI_GROUP} 01 $ab >/dev/null 2>&1; '
             f'done; rm -f "$P" "$C"; echo "uploaded $sz bytes to {hex(addr)}"')
         self.sh(script)
 
     def scsi_exec(self, addr):
-        """Call `addr` as code on the device (c6 96 03). Pass addr|1 for Thumb."""
+        """Call `addr` as code on the device (c6 {SCSI_GROUP} 03). Pass addr|1 for Thumb."""
+        if self.darwin:
+            return self.mac.scsi(3, addr)
         dev = self.dev()
         ab = " ".join(f"{(addr >> s) & 0xff:02x}" for s in (24, 16, 8, 0))
-        self.sh(f'sudo sg_raw -o /dev/null -r 512 {dev} c6 96 03 {ab} >/dev/null 2>&1; '
+        self.sh(f'sudo sg_raw -o /dev/null -r 512 {dev} c6 {SCSI_GROUP} 03 {ab} >/dev/null 2>&1; '
                 f'echo "exec returned for {hex(addr)}"', check=False)
 
 
 def _local_ipod():
-    """True if an iPod block device is attached to THIS (Linux) machine."""
+    """True if an iPod is attached to THIS machine: a block device on Linux, or on
+    macOS the iPod SCSI nub that carries Apple's SCSITaskUserClient."""
+    if platform.system() == "Darwin":
+        # An ejected iPod has no BSD disk until START STOP UNIT reloads its
+        # media. MacDevice handles that on demand; do not fall back to SSH.
+        return True
     return platform.system() == "Linux" and subprocess.run(
         ["bash", "-c", "lsblk -dno MODEL 2>/dev/null | grep -qi ipod"]).returncode == 0
 
@@ -575,14 +686,14 @@ def setup_transport(persist=True):
         sys.exit("start: no transport configured. Run `start setup`, or pass "
                  "--local / --remote user@host (the iPod's machine).")
     print("start setup — where is the iPod attached?")
-    print("  1. This machine (iPod plugged into THIS computer; requires Linux)")
+    print("  1. This machine (iPod plugged into THIS computer; Linux or macOS)")
     print("  2. A remote Linux host over SSH (e.g. a Raspberry Pi)")
     choice = input("choose [1/2]: ").strip()
     cfg = load_config()
     if choice == "1":
-        if platform.system() != "Linux":
+        if platform.system() not in ("Linux", "Darwin"):
             sys.exit(f"start: this computer is {platform.system()}, but local SCSI access "
-                     "needs Linux (sg_raw). Choose option 2 and attach the iPod to a "
+                     "needs Linux (sg_raw) or macOS. Choose option 2 and attach the iPod to a "
                      "Linux host (such as a Raspberry Pi) over SSH.")
         cfg["MODE"] = "local"; cfg.pop("REMOTE", None); cfg.pop("PI", None)
         if persist: save_config(cfg); print(f"saved -> {CONFIG_FILE} (local)")
@@ -602,8 +713,8 @@ def detect_transport(args, need_device=True):
     env, then a directly-attached iPod, then the saved config, else (for device
     ops) the first-run setup prompt."""
     if getattr(args, "local", False):
-        if platform.system() != "Linux":
-            sys.exit(f"start: --local needs Linux for SCSI (this is {platform.system()}); "
+        if platform.system() not in ("Linux", "Darwin"):
+            sys.exit(f"start: --local needs Linux or macOS for SCSI (this is {platform.system()}); "
                      "use --remote user@host to reach the iPod's Linux computer.")
         return Transport("local", None)
     if getattr(args, "remote", None):
@@ -693,7 +804,7 @@ def cmd_new(args):
     print(f"  apps/{name}/Info.plist      — org.nanoapps.{name} / \"{display}\"")
     print("\nnext:")
     print(f"  ./start build {name}        # compile it")
-    print(f"  ./start install {name}      # install it (+resident) to the home screen, then tap its icon")
+    print(f"  ./start install {name}      # install it to the home screen, then tap its icon")
 
 
 def cmd_build(args):
@@ -736,24 +847,24 @@ def cmd_build(args):
             if log:
                 print(f"        (full log: {log})")
     if fails:
-        print(f"==> {fails} target(s) FAILED")
+        raise SystemExit(f"==> {fails} target(s) FAILED")
 
 
 def is_app_target(rel):
     """An installable surface app == an apps/ dir that the pack ships (not the
     resident). Everything else (harnesses/, system/) is a one-shot exec."""
-    return rel.startswith("apps/") and Path(rel).name not in NONAPPS
+    return (ROOT / rel / "Info.plist").is_file() and Path(rel).name not in NONAPPS
 
 
 # ---- link address + one-shot SCSI exec ---------------------------------------
 def _link_va(elf):
     """LINK_VA == the .text load address baked into the ELF by the linker script
     (works whether the app set LVGL_ENABLE or overrode LINK_VA directly). The
-    resident links at 0x09130000, plain SDK apps at 0x0867f8e4 — getting this wrong
+    fixed-VA harnesses and plain SDK apps may use different addresses — getting this wrong
     uploads + execs the binary at the wrong address and crashes the device, so
     parse readelf in Python rather than a fragile shell/awk pipeline.
 
-      readelf -S line:  [ 1] .text  PROGBITS  09130000 001000 ...
+      readelf -S line:  [ 1] .text  PROGBITS  0867f8e4 001000 ...
                               ^name  ^type     ^addr
     """
     out = subprocess.run(["arm-none-eabi-readelf", "-S", str(elf)],
@@ -795,8 +906,11 @@ def _push_run(tr, name):
         sys.exit(f"{tr.dev()} never appeared — put the iPod in Connected mode")
     # unmount + eject so the FS is quiescent, then upload + exec, then eject again
     # (the SCSI exec re-enters Connected mode; the post-eject lands us on home).
-    tr.sh(f"sudo umount {tr.dev()}1 2>/dev/null; sudo umount {tr.dev()} 2>/dev/null; true", check=False)
-    tr.eject()
+    if tr.darwin:
+        subprocess.run(["diskutil", "unmountDisk", tr.dev()], check=True)
+    else:
+        tr.sh(f"sudo umount {tr.part()} 2>/dev/null; sudo umount {tr.dev()} 2>/dev/null; true", check=False)
+        tr.eject()
     time.sleep(3)
     tr.scsi_write_file(str(binp), link_va)
     tr.scsi_exec(link_va | 1)
@@ -820,7 +934,7 @@ sudo mkdir -p {mnt}
 mounted=
 for i in $(seq 1 6); do
   sudo umount {mnt} 2>/dev/null || true
-  if sudo mount -o rw,flush {part} {mnt} 2>/dev/null && sudo touch {mnt}/.hbrw 2>/dev/null; then
+  if sudo mount -o rw,flush,uid=$(id -u),gid=$(id -g) {part} {mnt} 2>/dev/null && sudo touch {mnt}/.hbrw 2>/dev/null; then
     sudo rm -f {mnt}/.hbrw; mounted=1; break
   fi
   sudo umount {mnt} 2>/dev/null || true
@@ -831,95 +945,169 @@ done
 """
 
 
+def build_firmware(revision, ipsw=None):
+    """Fetch firmware dependencies and the stock Apple IPSW automatically."""
+    ensure_build_deps()
+    python = VENV / "bin/python"
+    if not python.exists():
+        subprocess.run([sys.executable, "-m", "venv", str(VENV)], check=True)
+    check = subprocess.run([str(python), "-c",
+        "import fontTools, pyfatfs, PIL, elftools, afdko, pkg_resources"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if check.returncode or not (VENV / "bin/otfautohint").exists():
+        subprocess.run([str(python), "-m", "pip", "install", "afdko==4.0.2",
+                        "pyfatfs==1.1.0", "setuptools<81", "pyelftools", "Pillow"], check=True)
+    env = dict(os.environ, PATH=str(VENV / "bin") + os.pathsep + os.environ.get("PATH", ""))
+    command = [str(python), str(ROOT / "tools/build_firmware.py"), "--revision", revision]
+    if ipsw:
+        command += ["--ipsw", str(ipsw.resolve())]
+    subprocess.run(command, env=env, check=True)
+    return ROOT / "build/firmware"
+
+
+def setup_firmware(tr):
+    """First install stays in ./start; Finder performs the native macOS update."""
+    print("First install: set up firmware 1.1.2.")
+    revision = input("  iPod nano hardware revision [2012/2015]: ").strip()
+    if revision not in ("2012", "2015"):
+        raise SystemExit("Choose the iPod's hardware revision: 2012 or 2015.")
+    bundle = build_firmware(revision)
+    image = bundle / f"NanoApps-{revision}-Model.ipsw"
+    if tr.darwin:
+        subprocess.run(["open", "-R", str(image)], check=True)
+        print("In Finder, select the iPod. Hold Option and click Check for Update, "
+              "then select this IPSW:")
+    else:
+        print("In Finder (Option + Check for Update) or iTunes (Shift + Check for Update), "
+              "select this IPSW:")
+    print(f"  {image}")
+    input("After the update finishes and the iPod reconnects, press Return to install apps: ")
+    # Re-enumeration can assign a new disk node. Select again rather than reuse it.
+    tr._dev = None
+    if tr.darwin:
+        tr._mac = None
+    # Verify only the new debug channel. Stock firmware cannot satisfy this check.
+    if tr.peek(0x0819c1d4, 140) != (ROOT / "system/firmware_publisher/build/scsi-stub.bin").read_bytes():
+        raise SystemExit("The NanoApps firmware update is not active; app files were not changed.")
+    tr.loader_bundle = bundle
+
+
 def _install_disk(tr, src, data, data_force):
-    """Mount the iPod's FAT partition and write the staged /Apps tree. Preserves
-    /Apps/Data; sweeps retired layouts. Never DRAM-stages (that white-screens the
-    live OS)."""
-    stage = "/tmp/hbapps"
-    tr.stage(f"{src}/Apps", f"{stage}/Apps")
-    if (data or data_force) and (ROOT / "data").is_dir():
-        tr.stage(str(ROOT / "data"), f"{stage}/data")
-    dev = tr.dev(); part = dev + "1"
-    mnt = os.environ.get("IPOD_MOUNT", "/mnt/nanoapps-ipod")
-    force = "1" if data_force else ""
-    copy = f"""# Replace the app payload but PRESERVE {mnt}/Apps/Data, and sweep retired layouts
-# (old /iPod_Control/hb*, hbapps/hbicons names, /Apps/*.app bundles).
-sudo rm -rf {mnt}/iPod_Control/hbapps {mnt}/iPod_Control/hbicons {mnt}/iPod_Control/hbapps.pack 2>/dev/null || true
-sudo rm -rf {mnt}/Apps/hbapps {mnt}/Apps/hbicons {mnt}/Apps/hbapps.pack {mnt}/Apps/*.app 2>/dev/null || true
-sudo rm -rf {mnt}/Apps/AllApps.pack {mnt}/Apps/Executables {mnt}/Apps/Icons 2>/dev/null || true
-sudo mkdir -p {mnt}/Apps
-sudo cp {stage}/Apps/AllApps.pack {mnt}/Apps/AllApps.pack
-sudo cp -r {stage}/Apps/Executables {mnt}/Apps/Executables
-sudo cp -r {stage}/Apps/Icons {mnt}/Apps/Icons
-if [ -d {stage}/data ]; then
-  sudo mkdir -p {mnt}/Apps/Data
-  for d in {stage}/data/*/; do
-    [ -d "$d" ] || continue
-    n=$(basename "$d")
-    if [ -d "{mnt}/Apps/Data/$n" ] && [ -z "{force}" ]; then
-      echo "  data: keep $n (already on device)"
-    else
-      sudo rm -rf "{mnt}/Apps/Data/$n"; sudo cp -r "$d" "{mnt}/Apps/Data/$n"; echo "  data: copied $n"
-    fi
-  done
-fi
-sudo sync
-echo "/Apps/Executables: $(ls {mnt}/Apps/Executables | wc -l | tr -d ' ')"
-[ -d {mnt}/Apps/Data ] && echo "/Apps/Data folders: $(ls {mnt}/Apps/Data | wc -l | tr -d ' ')"
-sudo umount {mnt}
-echo 'apps installed to disk'"""
-    tr.sh(_fat_mount_prep(dev, part, mnt) + copy)
+    """Mount the iPod and merge the staged /Apps tree, preserving user data."""
+    if tr.mode == "local":
+        if tr.darwin:
+            mount = tr.mac.mount()
+        else:
+            tr.sh(_fat_mount_prep(tr.dev(), tr.part(), tr.mnt()))
+            mount = Path(tr.mnt())
+        loader = getattr(tr, "loader_bundle", None)
+        runtime_ready = False
+        if not loader:
+            try:
+                report = tr.peek(0x086c9b84, 512)
+                runtime_ready = (len(report) == 512 and
+                    struct.unpack_from('<I', report, 0x2c)[0] == 0x32505452 and
+                    struct.unpack_from('<I', report, 0x160)[0] == RUNTIME_ABI and
+                    struct.unpack_from('<I', report, 0x164)[0] == 4 and
+                    struct.unpack_from('<I', report, 0x168)[0] == 0x4449534b)
+            except (RuntimeError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                pass
+            # SCSI reads unmount the disk on macOS; reacquire the current mount.
+            if tr.darwin:
+                mount = tr.mac.mount()
+            else:
+                tr.sh(_fat_mount_prep(tr.dev(), tr.part(), tr.mnt()))
+                mount = Path(tr.mnt())
+        if not loader and not runtime_ready:
+            setup_firmware(tr)
+            loader = tr.loader_bundle
+            if tr.darwin:
+                mount = tr.mac.mount()
+            else:
+                tr.sh(_fat_mount_prep(tr.dev(), tr.part(), tr.mnt()))
+                mount = Path(tr.mnt())
+        if loader:
+            import json, hashlib
+            from wrap_resident_slot import validate_hrl1, validate_slot
+            metadata = json.loads((loader / "build.json").read_text())
+            if metadata.get("firmware") != "1.1.2" or metadata.get("scsi_group") != "98":
+                raise SystemExit("loader bundle is not a current 1.1.2 build")
+            runtime = loader / "resources/NanoApps"
+            expected = metadata.get("runtime_files", {})
+            if set(expected) != {"loader.hbapp"}:
+                raise SystemExit("loader bundle lacks runtime file hashes")
+            for name, digest in expected.items():
+                if hashlib.sha256((runtime / name).read_bytes()).hexdigest() != digest:
+                    raise SystemExit("loader bundle source identity check failed")
+            validate_hrl1((runtime / "loader.hbapp").read_bytes())
+            validate_slot((loader / "Library/resident.hbapp").read_bytes())
+            tr.install_resident = loader / "Library/resident.hbapp"
+        count, backup = install_app_files(Path(src) / "Apps", mount,
+            ROOT / "build/install-backups", getattr(tr, "install_resident", None),
+            retired=("hb.nanobtfix",))
+        if data or data_force:
+            for source in (ROOT / "data").rglob("*"):
+                target = mount / "Data" / source.relative_to(ROOT / "data")
+                if source.is_file() and (data_force or not target.exists()):
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source, target)
+        subprocess.run(["sync"], check=True)
+        print(f"Catalog: {count} apps. Backup: {backup}")
+        return
+    raise SystemExit("App installation requires a directly attached Mac or Linux host.")
 
 
 # ---- full app deploy ---------------------------------------------------------
-def _deploy_apps(tr, names, data, data_force, resident_only):
-    print("==> [1/5] build resident")
-    subprocess.run(["make", "-s", "-C", str(ROOT / "system" / "silver_resident")], check=True)
-
-    if resident_only:
-        print("==> [2/5] skip app build (resident only)")
+def _deploy_apps(tr, names, data, data_force, resident_only, untethered):
+    if not untethered:
+        raise SystemExit("The heap resident is file-loaded. Use --untethered (the default).")
+    from wrap_resident_slot import source_version
+    os.environ.setdefault('SOURCE_DATE_EPOCH', str(source_version()))
+    resident = None
+    if not names or resident_only:
+        subprocess.run(["make", "-s", "-C", str(ROOT / "system/silver_resident")], check=True)
+        slot = ROOT / "build/firmware/Library/resident.hbapp"
+        slot.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run([sys.executable, str(ROOT / "tools/wrap_resident_slot.py"),
+                        str(ROOT / "system/silver_resident/build/silver_resident.hbapp"), str(slot)], check=True)
+        resident = slot
+    if not resident_only:
+        for name in names or _app_dirs():
+            subprocess.run(["make", "-s", "-C", str(ROOT / resolve_target(name))], check=True)
+        subprocess.run([sys.executable, str(ROOT / "tools/build_apps.py"), *names], check=True)
     else:
-        build = names or _app_dirs()
-        print(f"==> [2/5] build {len(build)} app(s)")
-        failed = []
-        for a in build:
-            if subprocess.run(["make", "-s", "-C", str(ROOT / "apps" / a)],
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
-                print(f"    {a:<18} ok")
-            else:
-                print(f"    {a:<18} FAIL"); failed.append(a)
-        # Only abort if the user NAMED an app that failed; an all-apps build tolerates
-        # the odd non-packaged probe that doesn't compile (build_apps.py packs only
-        # apps that emitted a .hbapp).
-        if failed and names:
-            sys.exit(f"!! named target(s) failed: {', '.join(failed)}")
-
-    print("==> [3/5] pack")
-    subprocess.run(["python3", str(ROOT / "tools" / "build_apps.py")], check=True)
-
-    print("==> [4/5] install to iPod disk")
-    if data_force:   print("    (seeding data/ -> /Apps/Data, OVERWRITING existing)")
-    elif data:       print("    (seeding data/ -> /Apps/Data, keeping existing)")
+        stage = Path("/tmp/hbapps/Apps")
+        shutil.rmtree(stage, ignore_errors=True)
+        stage.mkdir(parents=True, exist_ok=True)
+    tr.install_resident = resident
     _install_disk(tr, "/tmp/hbapps", data, data_force)
-
-    # install_disk only writes files; nothing on the home screen changes until the
-    # resident is re-exec'd to register the icons + on-tap loader.
-    print("==> [5/5] exec resident")
-    _push_run(tr, "silver_resident")
-    print("\n==> All done! On the iPod, wait for the Home Screen, then open any built-in")
-    print("    app (like Music or Settings) and head back Home, and your apps will appear.")
-    print("    Your apps need re-registering each time the iPod restarts. To do it,")
-    print(f"    just run this again and choose \"Install resident only\":")
-    print(f"      {ROOT / 'start'}")
+    resident = getattr(tr, "install_resident", resident)
+    live = False
+    if resident is None:
+        try:
+            live = tr.peek(0x086c9b84 + 0x16c, 4) == struct.pack('<I', 0x4c495645)
+        except (RuntimeError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            pass
+    if live:
+        tr.eject()
+    else:
+        if resident is not None:
+            from wrap_resident_slot import validate_slot
+            tr.restart(expected_version=validate_slot(resident.read_bytes())[1])
+        else:
+            tr.restart()
+    print("Installed files and merged app catalog.")
 
 
 def cmd_install(args, tr):
-    """Install to the iPod over whichever transport (local or remote-over-SSH). App
-    targets (or none) go through the pack pipeline; harness/system targets are
-    built + SCSI-exec'd once — so `start install <harness>` deploys a harness too."""
+    """Build and install apps, or execute a standalone harness over C6/98."""
     ensure_build_deps()
     ensure_device_deps(tr)          # auto-install the iPod-machine's SCSI/FAT tools
     targets = list(getattr(args, "targets", []) or [])
+    untethered = bool(getattr(args, "untethered", True))
+    tr.loader_bundle = getattr(args, "loader_bundle", None)
+    if tr.loader_bundle and targets:
+        raise SystemExit("Initial setup rebuilds the complete catalog; omit app names.")
     app_targets, oneshot = [], []
     for t in targets:
         rel = resolve_target(t)
@@ -937,7 +1125,7 @@ def cmd_install(args, tr):
         names = [t for t, _ in app_targets]
         note = " +demo-data(force)" if data_force else (" +demo-data" if data else "")
         print(f"==> install ({tr.desc}){note} {' '.join(names) or '[all apps]'}")
-        _deploy_apps(tr, names, data, data_force, resident_only)
+        _deploy_apps(tr, names, data, data_force, resident_only, untethered)
 
 
 def _remote_install(tr, names):
@@ -994,9 +1182,10 @@ def cmd_bootstrap(args, tr):
     import importlib.util
     host_tool("python3 Pillow", importlib.util.find_spec("PIL") is not None, pip="pillow")
     host_tool("rsync", _have("rsync"), brew="rsync", linux="rsync")
-    host_tool("ssh", _have("ssh"), brew="openssh",
-              linux={"apt-get": "openssh-client", "dnf": "openssh-clients",
-                     "pacman": "openssh", "zypper": "openssh"})
+    if tr.mode == "ssh":
+        host_tool("ssh", _have("ssh"), brew="openssh",
+                  linux={"apt-get": "openssh-client", "dnf": "openssh-clients",
+                         "pacman": "openssh", "zypper": "openssh"})
 
     print("\n[lvgl] stock upstream checkout")
     if not setup_lvgl(check_only=check_only):
@@ -1032,10 +1221,12 @@ def cmd_bootstrap(args, tr):
                     else:
                         _remote_install(tr, pkgs)
     elif darwin:
-        # macOS is never the iPod's host (no sg_raw). The device tools live on the
-        # iPod's Linux computer — point the user at setup instead of "installing".
-        print("  (skipped — macOS can't drive SCSI; the iPod's Linux computer holds"
-              " these. Run `start setup` to point start at it.)")
+        # macOS drives the iPod through Apple's SCSITaskUserClient (tools/macos/
+        # ipod_sg_raw, built here from source); diskutil does mount/eject/repair.
+        ok = _ensure_ipod_sg_raw(build=not check_only)
+        print(f"  ipod_sg_raw            {'ok' if ok else 'MISSING (built on first use; needs xcode-select --install)'}")
+        if not ok and check_only:
+            missing.append("tools/macos/ipod_sg_raw")
     else:
         # local transport == you're ON the iPod's Linux computer: the device tools
         # are needed right here.
@@ -1054,7 +1245,10 @@ def cmd_bootstrap(args, tr):
 
 
 def cmd_run(args, tr):
-    _push_run(tr, Path(resolve_target(args.target)).name)
+    rel = resolve_target(args.target)
+    if is_app_target(rel):
+        raise SystemExit(f"{args.target} is a Home Screen app; use ./start install {args.target}")
+    _push_run(tr, Path(rel).name)
 
 
 def cmd_eject(args, tr):
@@ -1069,8 +1263,11 @@ def cmd_fsck(args, tr):
     FAT marked 'dirty', which makes Linux mount it READ-ONLY (installs then fail
     with 'Read-only file system'). This clears that and verifies a read-write
     mount."""
-    dev = tr.dev(); part = dev + "1"
-    mnt = os.environ.get("IPOD_MOUNT", "/mnt/nanoapps-ipod")
+    if tr.darwin:
+        subprocess.run(["diskutil", "repairVolume", tr.part()], check=True)
+        return
+    dev = tr.dev(); part = tr.part()
+    mnt = tr.mnt()
     print(f"==> repairing {part} on the iPod's computer")
     script = f"""sudo sg_start {dev} --loej 2>/dev/null || true
 for i in $(seq 1 40); do test -e {part} && break; sleep 1; done
@@ -1079,7 +1276,7 @@ udisksctl unmount -b {part} 2>/dev/null || sudo umount {part} 2>/dev/null || tru
 sudo fsck.vfat -a -w -v {part} 2>&1 | tail -20 || sudo fsck.vfat -a -w {part} || true
 echo '--- verifying read-write mount ---'
 sudo mkdir -p {mnt}
-if sudo mount -o rw,flush {part} {mnt} 2>/dev/null && sudo touch {mnt}/.hbrw 2>/dev/null; then
+if sudo mount -o rw,flush,uid=$(id -u),gid=$(id -g) {part} {mnt} 2>/dev/null && sudo touch {mnt}/.hbrw 2>/dev/null; then
   sudo rm -f {mnt}/.hbrw; sudo umount {mnt}; echo 'OK: the iPod filesystem is healthy and writable'
 else
   sudo umount {mnt} 2>/dev/null || true
@@ -1094,8 +1291,11 @@ fi"""
 def cmd_remount(args, tr):
     """Put the iPod into Connected (mass-storage) mode and mount its FAT partition
     read-write on the iPod's computer (the inverse of eject)."""
-    dev = tr.dev(); part = dev + "1"
-    mnt = os.environ.get("IPOD_MOUNT", "/mnt/nanoapps-ipod")
+    if tr.darwin:
+        print(tr.mac.mount())
+        return
+    dev = tr.dev(); part = tr.part()
+    mnt = tr.mnt()
     print(f"==> mounting {part} read-write at {mnt}")
     tr.sh(_fat_mount_prep(dev, part, mnt) + f"echo 'mounted read-write at {mnt}'")
 
@@ -1116,7 +1316,13 @@ def cmd_peek(args, tr):
 
 
 def cmd_trace(args, tr):
-    data = tr.peek(TRACE_RING, 9 * 0x200)
+    report = tr.peek(0x086c9b84, 512)
+    if struct.unpack_from("<I", report, 0x2c)[0] != 0x32505452:
+        raise SystemExit("The current heap resident has not published a boot report")
+    address = struct.unpack_from("<I", report, 0x150)[0]
+    if not 0x08d00000 <= address < 0x0a000000 - 4112:
+        raise SystemExit("The current resident has not published a trace ring")
+    data = tr.peek(address, 4112)
     if len(data) < 16:
         sys.exit(f"peek returned no data — check the iPod is attached ({tr.desc})")
     magic, idx, count, _ = struct.unpack_from("<IIII", data, 0)
@@ -1146,7 +1352,7 @@ def cmd_pull(args, tr):
 
     if what == "bench":
         out = ROOT / "bench_results"; out.mkdir(exist_ok=True)
-        n = tr._mount_pull(["Apps/Data/Bench/bench_*.csv"])
+        n = tr._mount_pull(["Data/Bench/bench_*.csv"])
         if n < 0:
             sys.exit("could not mount the iPod (disk mode?) — try replugging")
         if n == 0:
@@ -1321,7 +1527,7 @@ def pick_target(apps=True, harnesses=True):
                     if (d / "Makefile").is_file() and d.name not in NONAPPS]
     if harnesses:
         harn = [d.name for d in sorted((ROOT / "harnesses").iterdir())
-                if (d / "Makefile").is_file()]
+                if (d / "Makefile").is_file() and not (d / "Info.plist").exists()]
     names = app_list + harn
     if app_list:
         print("\n  apps:")
@@ -1351,14 +1557,15 @@ def wizard(args, tr):
         return argparse.Namespace(targets=kw.get("targets", []),
                                   demo_data=kw.get("demo_data", False),
                                   demo_data_force=kw.get("demo_data_force", False),
-                                  resident_only=kw.get("resident_only", False))
+                                  resident_only=kw.get("resident_only", False),
+                                  untethered=kw.get("untethered", True))
     actions = [
         ("Install all apps",         lambda: cmd_install(ins(), tr)),
         ("Install all apps with demo data", lambda: cmd_install(ins(demo_data=True), tr)),
         ("Install all apps + FORCE-recopy demo data (overwrite on-device edits)",
                                      lambda: cmd_install(ins(demo_data=True, demo_data_force=True), tr)),
         ("Install one app",          lambda: cmd_install(ins(targets=[pick_target(harnesses=False)]), tr)),
-        ("Install resident only (makes homebrew apps show up after restart)",
+        ("Update resident only",
                                      lambda: cmd_install(ins(resident_only=True), tr)),
         ("Run a test harness once",  lambda: cmd_run(argparse.Namespace(target=pick_target(apps=False)), tr)),
         ("Pull screenshots and screen recordings", lambda: cmd_pull(argparse.Namespace(what="media", out=None), tr)),
@@ -1400,11 +1607,13 @@ def main():
         sp = sub.add_parser(name)
         sp.add_argument("targets", nargs="*")
         sp.add_argument("--demo-data", "--data", dest="demo_data", action="store_true",
-                        help="also copy data/<Name>/ -> /Apps/Data, skipping folders already on device")
+                        help="also copy data/<Name>/ -> /Data, skipping folders already on device")
         sp.add_argument("--demo-data-force", "--data-force", dest="demo_data_force", action="store_true",
-                        help="copy data/ -> /Apps/Data, OVERWRITING folders already on device")
+                        help="copy data/ -> /Data, OVERWRITING folders already on device")
         sp.add_argument("--resident-only", action="store_true",
-                        help="skip the app compile; rebuild + re-exec just the resident (repack/install reuse built blobs)")
+                        help="update only the inactive resident slot; preserve the app catalog")
+        sp.add_argument("--loader-bundle", type=Path, help="matching output from start firmware build")
+        sp.add_argument("--untethered", action="store_true", default=True, help=argparse.SUPPRESS)
     for name in ("deps", "bootstrap"):          # bootstrap == alias
         sp = sub.add_parser(name)
         sp.add_argument("--check", action="store_true", help="report missing deps but don't install")
@@ -1417,10 +1626,18 @@ def main():
                     help="clone a specific existing app instead of the kind's default template")
     sp.add_argument("--title", help="home-screen display name (default: from the name)")
     sp = sub.add_parser("run");    sp.add_argument("target")
+    sp = sub.add_parser("firmware")
+    sp.add_argument("operation", choices=["build"])
+    sp.add_argument("--ipsw", type=Path, help="optional cached Apple IPSW (downloads automatically)")
+    sp.add_argument("--revision", choices=["2012", "2015"], required=True)
     sp = sub.add_parser("build");  sp.add_argument("targets", nargs="*")
+    sp = sub.add_parser("package", help="build a standalone prebuilt app ZIP (no device needed)")
+    sp.add_argument("target")
+    sp.add_argument("--output", type=Path, help="ZIP destination (default: build/packages/APP.zip)")
     sp = sub.add_parser("peek");   sp.add_argument("addr"); sp.add_argument("n", nargs="?", default="0x200")
     sp = sub.add_parser("trace");  sp.add_argument("n", nargs="?", type=int, default=48)
     sub.add_parser("eject")
+    sub.add_parser("reboot")
     sub.add_parser("remount")
     sub.add_parser("fsck")
     sp = sub.add_parser("pull")
@@ -1441,8 +1658,19 @@ def main():
     args = p.parse_args()
 
     # these don't touch the device, so don't make them prompt for the iPod's location
+    if args.cmd == "firmware":
+        build_firmware(args.revision, args.ipsw)
+        return
     if args.cmd == "build":
         cmd_build(args); return
+    if args.cmd == "package":
+        ensure_build_deps()
+        from build_apps import app_path
+        from package_app import package_app
+        folder = app_path(args.target)
+        subprocess.run(["make", "-s", "-C", str(folder)], check=True)
+        package_app(args.target, args.output)
+        return
     if args.cmd == "setup":
         cmd_setup(args); return
     if args.cmd == "new":
@@ -1464,6 +1692,9 @@ def main():
         cmd_trace(args, tr)
     elif args.cmd == "eject":
         cmd_eject(args, tr)
+    elif args.cmd == "reboot":
+        ensure_device_deps(tr)
+        tr.restart()
     elif args.cmd == "remount":
         cmd_remount(args, tr)
     elif args.cmd == "fsck":

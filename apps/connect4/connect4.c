@@ -24,8 +24,9 @@
 #define HUMAN 1
 #define AI    2
 
-#define CANVAS_BUF_ADDR  0x092E0000u
-static uint8_t * const s_canvas_buf = (uint8_t *)CANVAS_BUF_ADDR;
+/* In the app's own arena: the old fixed 0x092E0000 lies inside the OS heap
+ * and was overwriting live objects (and sometimes this app's own code). */
+static uint8_t s_canvas_buf[BOARD_W * BOARD_H * 4] __attribute__((aligned(4)));
 
 static int8_t s_board[ROWS][COLS];
 static int    s_winner = 0;     /* 0 = ongoing, 1 = human, 2 = AI, 3 = draw */

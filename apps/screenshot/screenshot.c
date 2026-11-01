@@ -24,13 +24,11 @@
 #include "hb_heap.h"
 #include "lvgl/lvgl.h"
 #include "hb_lv_surface.h"
+#include "hb_shared.h"
 
-/* Resident RAM toggle: 1 => Home-triple-click takes a screenshot. Matches
- * SCREENSHOT_FLAG_ADDR in apps/silver_resident/silver_resident.c. */
-#define SCREENSHOT_FLAG_ADDR  0x09135ff0u
-/* Resident battery-100% override toggle (matches STATUSBAR_FLAG_ADDR in the
- * resident): 1 => the status-bar battery gauge reads full, for pretty shots. */
-#define STATUSBAR_FLAG_ADDR   0x09135fecu
+/* Both toggles live in the resident's shared block (hb_shared.h):
+ * screenshot_mode drives Home-triple-click, statusbar_demo makes the status bar
+ * read 9:41 with a full battery, for pretty shots. */
 
 #define MAX_SHOTS   64
 #define THUMB_W     66
@@ -242,8 +240,8 @@ static uint16_t *decode_fit(const char *name, int maxw, int maxh, int *ow, int *
 
 /* The resident reads this byte on Home-triple-click: 0 = nothing (Accessibility),
  * 1 = take a screenshot, 2 = start/stop a screen recording. */
-static uint8_t mode_get(void) { uint8_t m = *(volatile uint8_t *)SCREENSHOT_FLAG_ADDR; return m <= 2u ? m : 0u; }
-static void    mode_set(uint8_t m) { *(volatile uint8_t *)SCREENSHOT_FLAG_ADDR = m; }
+static uint8_t mode_get(void) { uint8_t m = hb_shared->screenshot_mode; return m <= 2u ? m : 0u; }
+static void    mode_set(uint8_t m) { hb_shared->screenshot_mode = m; }
 
 static const char *mode_name(uint8_t m)
 {
@@ -265,8 +263,7 @@ static void colors_open_cb(lv_event_t *e)
 static void battery_cb(lv_event_t *e)
 {
     lv_obj_t *sw = lv_event_get_target(e);
-    *(volatile uint8_t *)STATUSBAR_FLAG_ADDR =
-        lv_obj_has_state(sw, LV_STATE_CHECKED) ? 1u : 0u;
+    hb_shared->statusbar_demo = lv_obj_has_state(sw, LV_STATE_CHECKED) ? 1u : 0u;
 }
 
 /* Device colors set (index order matches the device-color field). */
@@ -812,7 +809,7 @@ static void build_settings(void)
     lv_obj_set_style_text_color(bl, lv_color_hex(0xFFFFFF), 0);
     lv_obj_set_flex_grow(bl, 1);
     lv_obj_t *bsw = lv_switch_create(brow);
-    if (*(volatile uint8_t *)STATUSBAR_FLAG_ADDR) lv_obj_add_state(bsw, LV_STATE_CHECKED);
+    if (hb_shared->statusbar_demo) lv_obj_add_state(bsw, LV_STATE_CHECKED);
     lv_obj_add_event_cb(bsw, battery_cb, LV_EVENT_VALUE_CHANGED, NULL);
 }
 

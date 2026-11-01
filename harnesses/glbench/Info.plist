@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>	<string>org.nanoapps.glbench</string>
+	<key>CFBundleName</key>		<string>GLBench</string>
+	<key>CFBundleExecutable</key>	<string>glbench</string>
+	<key>HBAppKind</key>			<integer>2</integer>
+	<key>HBIconGlyph</key>		<string>gauge-high</string>
+	<key>HBIconColor</key>		<string>#e6a817</string>
+</dict>
+</plist>
