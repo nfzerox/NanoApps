@@ -77,7 +77,7 @@ void plat_log(const char *format,...) {
 /* Sound events stay present in gameplay. The SDK's single-shot audio call needs the UI
  * task to idle while it plays, which a game drawing every frame never does; silent for now. */
 void plat_sound(int sound,float gain){(void)sound;(void)gain;}
-void port_crumb(const char *tag,uint32_t a,uint32_t b){(void)tag;(void)a;(void)b;}
+void port_crumb(const char *tag,uint32_t a,uint32_t b){hb_trace_log(tag,a,b);}
 
 /* Keep the screen lit: the OS does not see the touches the resident hands us, and dims
  * after ~20-40 s. Reset its idle clock like a touch every 10 s, as the other nano game

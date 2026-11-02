@@ -736,10 +736,10 @@ def detect_transport(args, need_device=True):
 
 # ------------------------------------------------------------------ targets ---
 def resolve_target(name):
-    for tree in ("apps", "system", "harnesses"):
+    for tree in ("apps", "system", "harnesses", "ports"):
         if (ROOT / tree / name).is_dir():
             return f"{tree}/{name}"
-    sys.exit(f"no such target: {name} (apps/ system/ harnesses/)")
+    sys.exit(f"no such target: {name} (apps/ system/ harnesses/ ports/)")
 
 
 # ----------------------------------------------------------------- commands ---

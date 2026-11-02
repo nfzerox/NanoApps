@@ -15,7 +15,7 @@ def main():
         art=Image.open(decoded).convert('RGBA')
         # the idol's face fills the middle of the square icon; the round frame crops the corners
         w,h=art.size;art=art.crop((w//10,h//10,w-w//10,h-h//10))
-        metadata=Path(__file__).resolve().parents[1]/'port/nano/app/Info.plist'
+        metadata=Path(__file__).resolve().parents[1]/'Info.plist'
         color=plistlib.loads(metadata.read_bytes())['HBIconColor'].removeprefix('#')
         rgb=tuple(int(color[i:i+2],16) for i in (0,2,4))
         a.out.parent.mkdir(parents=True,exist_ok=True);build_apps.make_png(None,rgb,a.out,art=art)

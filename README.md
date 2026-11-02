@@ -4,7 +4,7 @@
 [![NanoApps Overview](screenshots/NanoApps_Overview.png)](https://www.youtube.com/watch?v=18ioMXBhhTA)
 ▶️ **[Watch NanoApps in action on YouTube.](https://www.youtube.com/watch?v=18ioMXBhhTA)**
 
-NanoApps lets you [run a collection of](#included-apps), and [build your own](#contributing-to-nanoapps), homebrew apps on iPod nano 7th generation. Out of the box it includes essential utilities like Calculator, Countdown Days, Files, Paint, and Screenshots, productivity tools like Calendar, Notes, Reminders, and Books, and lightweight games like 2048, Tetris, Minesweeper, and Rhythm. NanoApps also adds compatibility with AirPods with H2 chip and iPhone Lightning Dock.
+NanoApps lets you [run a collection of](#included-apps), and [build your own](#build-and-install-nanoapps-yourself), homebrew apps on iPod nano 7th generation. Out of the box it includes essential utilities like Calculator, Countdown Days, Files, Paint, and Screenshots, productivity tools like Calendar, Notes, Reminders, and Books, and lightweight games like 2048, Tetris, Minesweeper, and Rhythm. NanoApps also adds compatibility with AirPods with H2 chip and iPhone Lightning Dock.
 
 Homebrew apps appear as colorful icons on the native nano Home Screen, render with the full LVGL widget toolkit, and launch with the familiar zoom animation, so they feel at home next to Music and Photos. Games and visualization apps can also use OpenGL ES for 3D rendering. Contributions are very welcome: see [Contributing to NanoApps](#contributing-to-nanoapps), join the [NanoApps Discord](https://discord.gg/Er3KJwaCMg), and share what you build on [r/ipod](https://www.reddit.com/r/ipod/).
 
@@ -168,6 +168,8 @@ include ../../sdk/hb_app.mk
 - **`RAW_SURFACE := 1`**: draw pixels straight into the framebuffer for fast immediate-mode apps and games. Implement `hb_raw_init(w, h)` and `hb_raw_frame(touch)` (see [`apps/paint`](apps/paint/paint.c)).
 
 LVGL widget apps have a budget of roughly 150 to 200 widgets each; dense grids should render to a canvas (see Paint, Elements, and the canvas-based games).
+
+Optional iOS game ports live under `ports/`. Run `python3 tools/build_ios_game.py --help` to prepare a matching original IPA and build an app bundle.
 
 **Keep the compiled app small.** There is a practical ceiling on an app's executable image (code plus bundled assets). If an app grows past roughly half a megabyte, it can fail to launch in a way that's easy to misread as a random bug: the device hangs or reboots when you open the app — and whether it happens can shift between compiler versions, so the same code may run for you and crash for someone else. Large **image assets** are almost always the cause; a single full-color bitmap can be 50 to 100 KB. If you hit this, downscale big images, use a more compact color format (for example RGB565 instead of ARGB8888 where you don't need alpha), or load them at runtime instead of compiling them in. The build prints the image size when it packs the app, so keep an eye on it and leave some headroom.
 

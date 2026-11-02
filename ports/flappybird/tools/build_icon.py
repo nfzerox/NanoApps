@@ -20,7 +20,7 @@ def main():
     else:raise ValueError('bird0_1 not in the atlas')
     art=art.crop(art.getchannel('A').getbbox())
     art=art.resize((art.width*4,art.height*4),Image.Resampling.NEAREST)   # keep the pixel art crisp
-    metadata=Path(__file__).resolve().parents[1]/'port/nano/app/Info.plist'
+    metadata=Path(__file__).resolve().parents[1]/'Info.plist'
     color=plistlib.loads(metadata.read_bytes())['HBIconColor'].removeprefix('#')
     rgb=tuple(int(color[i:i+2],16) for i in (0,2,4))
     a.out.parent.mkdir(parents=True,exist_ok=True);build_apps.make_png(None,rgb,a.out,art=art)

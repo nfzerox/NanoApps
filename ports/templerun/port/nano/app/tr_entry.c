@@ -6,7 +6,7 @@
 #include "hb_shared.h"
 #include "hb_heap.h"
 
-#define APP_FILE "/Apps/Executables/Temple Run.hbapp"
+#include "../../../../ios_app_path.h"
 extern void tr_nano_frame(int w,int h,uint32_t frame);
 static uint32_t ran_before __attribute__((section(".noinit")));
 extern uint8_t tr_fast_redraw;
@@ -15,13 +15,15 @@ void *payload_entry(int op,void *fb,int w,int h,hb_shared_t *sh);
 /* A cached app image needs its own initial data restored on relaunch. */
 static int restore_data(void) {
     extern uint8_t __data_start[],_edata[];
-    uint32_t size=hb_fs_size(APP_FILE);
+    const char *app_file=ios_app_file("hb.templerun");
+    if(!app_file)return 0;
+    uint32_t size=hb_fs_size(app_file);
     if(size<24 || size>3u*1024u*1024u)return 0;
     uint32_t cap=(size+8191u)&~4095u;
     uint8_t *buf=hb_os_alloc(cap);
     if(!buf)return 0;
     int ok=0;
-    if(hb_fs_read(APP_FILE,buf,cap)==size) {
+    if(hb_fs_read(app_file,buf,cap)==size) {
         const uint32_t *hdr=(const uint32_t *)buf;
         if(hdr[0]==0x314c5248u && hdr[2]<=size-24 &&
            hdr[4]<=(size-24-hdr[2])/4 && hdr[1]<hdr[2]) {

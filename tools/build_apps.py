@@ -96,7 +96,7 @@ CIRC_X1, CIRC_Y1 = CIRC_X0 + CIRC_W, CIRC_Y0 + CIRC_H
 
 
 def app_path(name):
-    for tree in ('apps', 'harnesses'):
+    for tree in ('apps', 'harnesses', 'ports'):
         folder = ROOT / tree / name
         if (folder / 'Info.plist').is_file():
             return folder
@@ -312,6 +312,8 @@ def main(apps, out=None):
     for i, a in enumerate(apps):
         dst = icons_src / f"{ICON_BASE_ID + i}_{FMT:04x}.png"
         custom = app_path(a) / "icon.png"
+        if not custom.exists():
+            custom = app_path(a) / "build/icon.png"
         art = app_path(a) / "icon_art.png"
         if art.exists():
             make_png(None, metas[i]["color"], dst, art=Image.open(art).convert("RGBA"))

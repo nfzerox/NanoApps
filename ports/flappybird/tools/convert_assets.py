@@ -10,13 +10,12 @@ Requires Pillow, and macOS sips/afconvert for Apple's PNG variant and the sound 
 No game data is embedded here.
 """
 import argparse
-import hashlib
 import struct
 import subprocess
 from pathlib import Path
 from PIL import Image
+from app_binary import thin_armv7
 
-EXECUTABLE_SHA256 = 'b323b26eb21d89a28907db33933dbe4b0f758a769ebd4bf2958f15fd7b18f378'
 # Never drawn by 1.2: the solid overlays are drawn as plain quads, the green pipes are the
 # only pipes used.
 UNUSED = {'black', 'white', 'pipe2_down', 'pipe2_up'}
@@ -65,9 +64,7 @@ def pack(tiles):
 
 
 def convert(app, output):
-    digest = hashlib.sha256((app / 'flap').read_bytes()).hexdigest()
-    if digest != EXECUTABLE_SHA256:
-        raise ValueError('Use the inspected Flappy Bird 1.2 app; other builds need analysis')
+    thin_armv7(app / 'flap')
     output.mkdir(parents=True, exist_ok=True)
     decoded = output.parent / 'png'
     decoded.mkdir(exist_ok=True)

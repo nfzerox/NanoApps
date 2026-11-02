@@ -7,19 +7,18 @@ nothing; the vertex list the engine built is read just before it would be drawn)
 The Objective-C layer (view, sound, Game Center, adverts) is not run. The original
 executable is required and stays untracked.
 """
-import hashlib
 import math
 import re
 import struct
 import subprocess
 from pathlib import Path
+from app_binary import thin_armv7
 from unicorn import Uc, UC_ARCH_ARM, UC_MODE_THUMB, UC_HOOK_CODE
 from unicorn.arm_const import (UC_ARM_REG_R0, UC_ARM_REG_R1, UC_ARM_REG_R2, UC_ARM_REG_R3, UC_ARM_REG_SP,
                                UC_ARM_REG_LR, UC_ARM_REG_PC, UC_ARM_REG_C1_C0_2, UC_ARM_REG_FPEXC)
 
 ROOT = Path(__file__).resolve().parents[1]
 APP = ROOT / 'original/v1.2/Payload/Flap.app'
-SHA256 = 'b323b26eb21d89a28907db33933dbe4b0f758a769ebd4bf2958f15fd7b18f378'
 REGS = [UC_ARM_REG_R0, UC_ARM_REG_R1, UC_ARM_REG_R2, UC_ARM_REG_R3]
 HEAP, STACK, IMPORTS = 0x400000, 0x900000, 0xa00000
 GAME_CTOR, ENGINE_INIT, FRAME, SET_TOUCHES = 0x10574, 0xd268, 0xdba0, 0xe8e4
@@ -28,19 +27,6 @@ GAME_GLOBAL, SEED_W, SEED_Z = 0xfd614, 0xfd61c, 0xfd620
 
 def f32(x):
     return struct.unpack('<f', struct.pack('<f', x))[0]
-
-
-def thin_armv7(path):
-    """The armv7 slice of the universal executable."""
-    data = path.read_bytes()
-    if hashlib.sha256(data).hexdigest() != SHA256:
-        raise ValueError('Use the inspected Flappy Bird 1.2 executable')
-    count = struct.unpack_from('>I', data, 4)[0]
-    for i in range(count):
-        cpu, sub, off, size, _ = struct.unpack_from('>5I', data, 8 + 20 * i)
-        if cpu == 12 and sub == 9:
-            return data[off:off + size]
-    raise ValueError('no armv7 slice')
 
 
 class Original:
