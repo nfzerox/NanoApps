@@ -64,6 +64,13 @@ SDK_SRCS := \
     $(SDK_DIR)/hb_reloc_file.c \
     $(SDK_DIR)/hb_app_bundle.c
 
+# Most apps use the complete SDK above and let --gc-sections discard unused
+# modules. Small boot-critical images may provide SDK_SRCS_ONLY before
+# including this file so their layout does not depend on host linker GC.
+ifneq ($(strip $(SDK_SRCS_ONLY)),)
+  SDK_SRCS := $(SDK_SRCS_ONLY)
+endif
+
 CC      := arm-none-eabi-gcc
 OBJCOPY := arm-none-eabi-objcopy
 SIZE    := arm-none-eabi-size

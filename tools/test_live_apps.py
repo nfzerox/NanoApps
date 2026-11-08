@@ -89,8 +89,9 @@ class LiveAppTests(unittest.TestCase):
             else:
                 m.files.update(app_files('hb.second', 0x10000002))
             self.assertEqual(self.refresh(m), 1)
-        # resident, current catalog and one retired catalog; no app code loaded.
-        self.assertEqual(len(m.live_allocs), 3)
+        # resident, current catalog, one retired catalog, and the boot-lifetime
+        # sled + framebuffer; no app code loaded.
+        self.assertEqual(len(m.live_allocs), 5)
 
     def test_main_screen_action_refreshes_after_usb_return(self):
         m = self.boot()
@@ -254,7 +255,7 @@ class RegistrarTests(unittest.TestCase):
         m.handlers.pop(m.res_addr('hb_app_register_pack') & ~1)
         calls = []
         methods = {
-            'hb_silver_icon_grow_cache': 0, 'hb_silver_icon_register_lazy': 0x1000,
+            'hb_silver_icon_register_lazy': 0x1000,
             'hb_silver_icon_refresh': 0x1000, 'hb_silver_home_ensure_capacity': 0,
             'hb_silver_home_trim_pages': 0, 'hb_silver_home_reload': 0,
             'hb_silver_icon_set_name': 0, 'hb_silver_icon_set_hash': 0,

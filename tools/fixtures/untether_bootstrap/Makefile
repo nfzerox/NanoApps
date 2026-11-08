@@ -6,6 +6,9 @@
 APP_NAME := untether_bootstrap
 SRCS := cff_entry.S untether_bootstrap.c
 RELOC := 1
+# Like system/disk_bootstrap: a firmware-embedded loader, without the heavy-image
+# gate and chunked reads (see sdk/hb_reloc_file.c).
+EXTRA_CFLAGS += -DHB_RELOC_BOOT_ONLY
 include ../../../sdk/hb_app.mk
 
 STAGE_ELF := build/cff_heap_stage.elf

@@ -22,7 +22,6 @@
 
 /* Reused across refreshes; do not append another set of resource-chain nodes. */
 static void *s_label_obj[64], *s_label_node[64];
-static uint8_t s_pool_grown;
 
 static const hb_app_section_t *hb__find_section(const uint8_t *b,
                                                 const hb_app_bundle_t *hdr,
@@ -90,11 +89,10 @@ int hb_app_register_pack(const void *pack_v, void *(*alloc)(uint32_t size),
      * Each app a gets icon id first_icon + a (the resolver maps id-first -> the
      * a-th disk file). Skipped on a re-deploy. */
     if (register_to_os && (n || hb_silver_icon_live())) {
-        /* Grow the OS bitmap cache so our 56 ring entries don't make its frequent
-         * evictions (the 625 KB pool is already near-full) walk a long ring each
-         * time. Smaller than pin-all needed since our bitmaps aren't in the pool. */
-        if (!s_pool_grown && n > 8u)
-            s_pool_grown = hb_silver_icon_grow_cache(1u * 1024u * 1024u, alloc) != 0;
+        /* The OS bitmap cache is NOT grown here any more. A 1 MiB grow (for
+         * more than 8 apps) only shortened its eviction ring walks, and cost
+         * 1 MiB of boot heap that heavy apps need; nano7kit (Shimku) ran
+         * without it on hardware. hb_silver_icon_grow_cache stays available. */
         first_icon = register_to_os == 2 ? hb_silver_icon_refresh() :
                      hb_silver_icon_register_lazy(64, alloc);
         if (trace)

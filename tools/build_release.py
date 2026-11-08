@@ -22,8 +22,9 @@ from wrap_resident_slot import validate_hrl1, validate_slot, source_version
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_FILES = {'loader.hbapp'}
-# Keep LVGL diagnostics available to developers, outside the production disk ZIP.
-EXCLUDED_APPS = {'benchmark', 'stress', 'widgets'}
+# Keep LVGL diagnostics and developer tools available to developers, outside the
+# production disk ZIP.
+EXCLUDED_APPS = {'benchmark', 'stress', 'widgets', 'freeram', 'lap'}
 
 
 def release_apps():

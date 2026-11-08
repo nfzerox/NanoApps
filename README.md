@@ -8,7 +8,7 @@ NanoApps lets you [run a collection of](#included-apps), and [build your own](#b
 
 Homebrew apps appear as colorful icons on the native nano Home Screen, render with the full LVGL widget toolkit, and launch with the familiar zoom animation, so they feel at home next to Music and Photos. Games and visualization apps can also use OpenGL ES for 3D rendering. Contributions are very welcome: see [Contributing to NanoApps](#contributing-to-nanoapps), join the [NanoApps Discord](https://discord.gg/Er3KJwaCMg), and share what you build on [r/ipod](https://www.reddit.com/r/ipod/).
 
-Includes community work from [nano7-untethered](https://github.com/olievans123/nano7-untethered), [andrew867’s NanoApps](https://github.com/andrew867/NanoApps), [NanoBtFix](https://github.com/Merquice/NanoBtFix), [nano7-a1717-dock](https://github.com/Raphmatt/nano7-a1717-dock), and [ipod_sun](https://github.com/ninjaprawn/ipod_sun).
+Includes community work from [nano7-untethered](https://github.com/olievans123/nano7-untethered), [andrew867’s NanoApps](https://github.com/andrew867/NanoApps), [NanoBtFix](https://github.com/Merquice/NanoBtFix), [nano7-a1717-dock](https://github.com/Raphmatt/nano7-a1717-dock), [nano7kit](https://github.com/Shimku/nano7kit), and [ipod_sun](https://github.com/ninjaprawn/ipod_sun).
 
 ## Download and Install NanoApps
 

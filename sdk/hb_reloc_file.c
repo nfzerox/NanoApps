@@ -14,6 +14,12 @@
 #include "hb_heap.h"
 #include "hb_runtime_compat.h"
 
+/* HB_RELOC_BOOT_ONLY (disk_bootstrap) keeps the firmware-embedded loader
+ * exactly as shipped: no heavy-image gate, no chunked reads. From nano7kit by
+ * Shimku (MIT). */
+#define HB_RELOC_HEAP_MARGIN    (256u * 1024u)
+#define HB_RELOC_CHUNKED_ABOVE  (512u * 1024u)
+
 /* Selector diagnostics: high byte = last validation step (0 on success),
  * low 24 bits = file length. Missing files/header reads stop at step 1.
  * This distinguishes unavailable disk files from incompatible/corrupt slots
@@ -90,6 +96,15 @@ static void *load_file(const char *path, void **out_arena, uint32_t *out_len,
     /* nothrow allocator: a heap too fragmented for this image returns NULL (it
      * just doesn't load) instead of the operator-new panic-reboot. */
     file_step(3);
+#ifndef HB_RELOC_BOOT_ONLY
+    /* Heavy images (multi-MB QuickJS / game ports) also need the largest free
+     * block to cover the arena plus a margin for alignment slack, or the OS
+     * allocator can still fail hard. Refuse cleanly instead. */
+    if (hb_os_heap_largest() < need + h[5] + HB_RELOC_HEAP_MARGIN) {
+        hb_trace_log("HEAVYNO ", hb_os_heap_largest(), need + h[5]);
+        return 0;
+    }
+#endif
     arena = (uint8_t *)hb_os_alloc(need + h[5]);
     hb_trace_log("RLARENA ", (uint32_t)(uintptr_t)arena, need + h[5]);
     if (!arena)
@@ -97,6 +112,15 @@ static void *load_file(const char *path, void **out_arena, uint32_t *out_len,
     base = (uint8_t *)(((uintptr_t)arena + (h[5] - 1u)) & ~((uintptr_t)h[5] - 1u));
     src = base + (need - fsize);
     file_step(4);
+#ifndef HB_RELOC_BOOT_ONLY
+    /* Large disk images are read in pieces; small ones keep the one-shot read. */
+    if (volume == 0 && fsize > HB_RELOC_CHUNKED_ABOVE) {
+        if (hb_fs_read_chunked(path, src, fsize) != fsize) {
+            hb_os_free(arena);
+            return 0;
+        }
+    } else
+#endif
     if (hb_fs_read_at(path, src, fsize, volume) != fsize) {
         hb_os_free(arena);
         return 0;

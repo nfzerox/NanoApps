@@ -26,7 +26,7 @@ class ReleaseTests(unittest.TestCase):
         (apps / 'Demo.nanoapp/icon.bin').write_bytes(icon)
         (apps / 'Demo.nanoapp/manifest.napp').write_bytes(manifest_for(entry, hrl, icon))
         # Minimal source catalog used by package_release's completeness check.
-        for name in ('demo', 'benchmark', 'stress', 'widgets'):
+        for name in ('demo', 'benchmark', 'stress', 'widgets', 'freeram', 'lap'):
             source = root / 'apps' / name
             source.mkdir(parents=True)
             (source / 'Info.plist').touch()

@@ -22,8 +22,12 @@ typedef void (*bump_ref_t)(void *buf);
  * uses the OS file API on the UI task, (hb_fs_read declared in hb_sdk.h, included
  * via hb_silver_icon.h.) */
 
-#define ICON_LRU_N    20u                 /* resident icons (LRU) */
-#define ICON_BUF_SZ   (56u * 1024u)       /* >= a 112x112 ARGB bitmap header     */
+/* 16 x 50 KB instead of 20 x 56 KB saves ~320 KB of boot heap (nano7kit).
+ * Every icon.bin is exactly 112x112 ARGB + a 32-byte header = 50,208 bytes
+ * (enforced by tools/package_app.py), so 0xC800 always fits one. */
+#define ICON_LRU_N    16u                 /* resident icons (LRU) */
+#define ICON_BUF_SZ   0xC800u             /* >= a 112x112 ARGB bitmap + header   */
+_Static_assert(ICON_BUF_SZ >= 112u * 112u * 4u + 32u, "icon buffer holds one icon.bin");
 #define ICON_DISK_DIR "/Apps/Icons/"
 
 /* Lazy-resolver state: which ids we serve and the LRU of OS-heap buffers. It

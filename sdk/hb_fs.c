@@ -205,6 +205,31 @@ uint32_t hb_fs_read_at(const char *path, void *buf, uint32_t max_size, int volum
     return got;
 }
 
+/* Like hb_fs_read, but never asks the OS for more than FS_WRITE_CHUNK bytes in
+ * one read call, so a multi-megabyte .hbapp is not moved in a single request.
+ * Same open/close and one-shot object as hb_fs_read_at. */
+uint32_t hb_fs_read_chunked(const char *path, void *buf, uint32_t max_size)
+{
+    uint8_t *obj = s_oneshot_obj;
+    uint8_t *dst = (uint8_t *)buf;
+    uint32_t total = 0;
+    fobj_t f;
+    if (!fobj_begin(&f, obj, fs_scratch_cache(), path, false, FS_MAIN_VOLUME)) return 0;
+    while (total < max_size) {
+        uint32_t want = max_size - total;
+        uint64_t got64 = 0;   /* 64-bit slot: see hb_fs_size */
+        uint32_t got;
+        if (want > FS_WRITE_CHUNK) want = FS_WRITE_CHUNK;
+        if (FOBJ_READ(obj, want, dst + total, (uint32_t *)&got64) != 0) break;
+        got = (uint32_t)got64;
+        if (!got) break;
+        total += got;
+        if (got < want) break;   /* end of file */
+    }
+    FOBJ_CLOSE(obj);
+    return total;
+}
+
 /* ----- directory iteration -----
  *
  * Directory iteration and path helper entry points.

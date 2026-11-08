@@ -498,7 +498,10 @@ class ResidentTests(unittest.TestCase):
         self.assertTrue(BOOT_BASE <= (m.lr_at_action & ~1) < BOOT_BASE + m.boot_span)
         self.assertEqual(m.live_allocs[m.heap_base], hrl_info(m.res_blob)[2] + 16)
         self.assertEqual(sorted(m.live_allocs.values())[0], 12)  # empty live catalog
-        self.assertEqual(len(m.live_allocs), 2)
+        # resident, live catalog, and the boot-lifetime I-cache sled + framebuffer
+        self.assertIn(512 * 1024, m.live_allocs.values())
+        self.assertIn(240 * 432 * 4, m.live_allocs.values())
+        self.assertEqual(len(m.live_allocs), 4)
 
     def test_real_chain_never_writes_fixed_heap_window(self):
         m = ChainMachine(real_resident=True)

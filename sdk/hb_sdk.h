@@ -209,6 +209,8 @@ uint32_t hb_fs_read(const char *path, void *buf, uint32_t max_size);
 /* Explicit read-only volume access (0 = disk, 4 = firmware resources). */
 uint32_t hb_fs_read_at(const char *path, void *buf, uint32_t max_size, int volume);
 uint32_t hb_fs_size_at(const char *path, int volume);
+/* hb_fs_read on the disk volume in <= 256 KB read calls (for large images). */
+uint32_t hb_fs_read_chunked(const char *path, void *buf, uint32_t max_size);
 
 /* Directory iteration. Opaque storage; pass the same hb_dir_t through
    open / next / close. Caller owns the buffer.

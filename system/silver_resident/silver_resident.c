@@ -34,6 +34,7 @@
 #include "hb_reloc.h"
 #include "hb_app_api.h"
 #include "hb_touch_mb.h"
+#include "touch_latch.h"
 #include "hb_heap.h"
 #include "hb_record.h"
 #include "hb_app_bundle.h"
@@ -195,7 +196,8 @@ static const void *getres_hook(void *db, uint32_t type, long id, uint32_t *size)
  * before it drains the hardware touch list). We read the raw touch list at
  * that moment and LATCH a mailbox the LVGL surface indev reads — so a tap is
  * never missed (vs polling the transient list, which only caught ~1/4 of taps).
- * Mailbox: [magic, x, y, pressed] in s_shared.touch (read by hb_touch_mb.c). */
+ * Mailbox: [magic, x, y, pressed] in s_shared.touch (read by hb_touch_mb.c);
+ * the sample latched is the newest one queued (touch_latch.h). */
 #define ADDR_POSTTOUCH     0x084a27f6u
 #define POSTTOUCH_PROLOGUE 0xe92du        /* 'stmdb sp!,{r1-r9,lr}' — unpatched   */
 static const uint8_t POSTTOUCH_STOCK[12] = {
@@ -209,25 +211,25 @@ typedef int (*posttouch_t)(void *self);
 __attribute__((section(".text.hook"), used, noinline))
 static int hb_posttouch_hook(void *self)
 {
-    volatile uint32_t *head = (volatile uint32_t *)TOUCH_LIST_HEAD;
-    volatile int32_t  *mb   = s_shared.touch;
-    if (head[5] != 0) {
-        uint32_t end_node = head[4], first;
-        if (end_node >= 0x08000000u && end_node < 0x10000000u) {
-            first = *(volatile uint32_t *)end_node;
-            if (first >= 0x08000000u && first < 0x10000000u) {
-                volatile int32_t *v = (volatile int32_t *)(first + 8);
-                uint8_t st = *((volatile uint8_t *)(first + 8) + 4);
-                mb[1] = (int32_t)(int16_t)v[2];      /* x */
-                mb[2] = (int32_t)(int16_t)v[3];      /* y */
-                mb[3] = (st != 1) ? 1 : 0;           /* pressed unless the touch ended (status 1) */
-                mb[0] = (int32_t)TOUCH_MB_MAGIC;
-            }
-        }
-    } else {
+    volatile int32_t *mb = s_shared.touch;
+    int32_t x, y, pressed;
+    int r = hb_tl_pick((volatile hb_tl_word *)TOUCH_LIST_HEAD, &x, &y, &pressed);
+    if (r > 0) {
+        mb[1] = x;
+        mb[2] = y;
+        mb[3] = pressed;
+        mb[0] = (int32_t)TOUCH_MB_MAGIC;
+    } else if (r == 0) {
         mb[3] = 0;                                   /* no touch -> released */
         mb[0] = (int32_t)TOUCH_MB_MAGIC;
     }
+    /* Every queue's newest sample, for apps that track more than one finger
+     * (hb_shared_t.touch_snap). The mailbox above is unchanged. */
+    for (uint32_t q = 0; q < 8u; q++)
+        hb_tl_newest((volatile hb_tl_word *)(TOUCH_LIST_HEAD + q * 0x18u),
+                     s_shared.touch_snap.finger[q]);
+    s_shared.touch_snap.seq++;
+    s_shared.touch_snap.magic = HB_TOUCH_SNAP_MAGIC;
     return ((posttouch_t)TRAMP(s_posttouch_tramp))(self);
 }
 
@@ -385,6 +387,24 @@ typedef int (*dispatch_t)(void *self, const char *name, void *msg);
 #define VTABLE_COPY_SIZE   0x800u        /* generous (over-copy is safe; under is not) */
 static uint32_t s_vtable_copy[VTABLE_COPY_SIZE / 4u] __attribute__((aligned(8)));
 #define VTABLE_COPY_ADDR   ((uint32_t)(uintptr_t)s_vtable_copy)   /* our patched vtable copy */
+/* The GL view's own vtable copy (see hb_install_gl_draw). */
+static uint32_t s_gl_vtable_copy[VTABLE_COPY_SIZE / 4u] __attribute__((aligned(8)));
+#define GL_VTABLE_COPY_ADDR ((uint32_t)(uintptr_t)s_gl_vtable_copy)  /* separate from the custom-draw view's copy */
+
+/* The custom-draw view and the GL view are different classes and BOTH stay
+ * alive (cached) on the shared canvas. A single set of saved "real" handlers
+ * (message, visibility, destructors, exit) would be overwritten by whichever
+ * view was installed last: after a GL app, the custom-draw view forwarded its
+ * messages to the GL class's handlers and the iPod rebooted shortly after the
+ * next LVGL app opened (found in nano7kit by Shimku). Keep one set per view,
+ * chosen by the vtable copy the view runs on. */
+#define HB_VIEW_CUSTOM 0u
+#define HB_VIEW_GL     1u
+static uint32_t hb_view_kind(const void *self)
+{
+    return (self && *(const uint32_t *)self == GL_VTABLE_COPY_ADDR) ? HB_VIEW_GL
+                                                                     : HB_VIEW_CUSTOM;
+}
 #define A_TGFX_CTOR        0x084243dcu   /* the gfx constructor */
 #define A_TGFX_DTOR        0x0841abfcu   /* gfx object destructor */
 #define A_FOCUS_EXBORDER   0x084035e4u   /* the view's inner focus-rect (takes a gfx context) */
@@ -513,7 +533,7 @@ typedef int  (*msg_fn_t)(void *self, void *msg);
 
 /* The view's real message handler, captured from its vtable +0x40 before we patch the
  * slot (this view's class may override the message handler). */
-static msg_fn_t s_orig_msg;
+static msg_fn_t s_orig_msg[2];
 
 /* Our view's message handler override (UI task). On our heartbeat timer's timer message:
  * advance LVGL (lv_timer_handler) + Inval the view (-> draw callback blits s_fb) +
@@ -534,7 +554,10 @@ static int hb_msg_hook(void *self, void *msg)
         ((timer1_t)(A_TIMER_START | 1u))(TIMER_ADDR);           /* repeat          */
         return 1;
     }
-    return s_orig_msg ? s_orig_msg(self, msg) : 0;
+    {
+        msg_fn_t f = s_orig_msg[hb_view_kind(self)];
+        return f ? f(self, msg) : 0;
+    }
 }
 
 static void hb_surface_start_timer(void *view)
@@ -566,13 +589,13 @@ static void hb_surface_stop_timer(void)
 
 /* The view's real destructors, captured before we patch slots 0/1 of the copy. */
 typedef void (*dtor_t)(void *self);
-static dtor_t s_orig_dtor0, s_orig_dtor1;
+static dtor_t s_orig_dtor0[2], s_orig_dtor1[2];
 
 /* the view's visibility handler — the OS calls it with false when hiding the view
  * (quit transition), before destruction. We do it so the heartbeat can't fire into 
  * a hidden/freed view. */
 typedef void (*vis_fn_t)(void *self, int show);
-static vis_fn_t s_orig_visibility;
+static vis_fn_t s_orig_visibility[2];
 
 __attribute__((section(".text.hook"), used, noinline))
 static void hb_visibility_hook(void *self, int show)
@@ -580,7 +603,10 @@ static void hb_visibility_hook(void *self, int show)
     hb_trace_log("XSHOW   ", (uint32_t)(uintptr_t)self, (uint32_t)show);
     if (!show)
         hb_surface_stop_timer();
-    if (s_orig_visibility) s_orig_visibility(self, show);
+    {
+        vis_fn_t f = s_orig_visibility[hb_view_kind(self)];
+        if (f) f(self, show);
+    }
 }
 
 #if HB_REC_INTERCEPT
@@ -657,16 +683,18 @@ __attribute__((section(".text.hook"), used, noinline))
 static void hb_dtor_hook0(void *self)
 {
     hb_trace_log("XDTOR0  ", (uint32_t)(uintptr_t)self, 0);
+    dtor_t f = s_orig_dtor0[hb_view_kind(self)];
     hb_surface_stop_timer();
-    if (s_orig_dtor0) s_orig_dtor0(self);
+    if (f) f(self);
 }
 
 __attribute__((section(".text.hook"), used, noinline))
 static void hb_dtor_hook1(void *self)
 {
     hb_trace_log("XDTOR1  ", (uint32_t)(uintptr_t)self, 0);
+    dtor_t f = s_orig_dtor1[hb_view_kind(self)];
     hb_surface_stop_timer();
-    if (s_orig_dtor1) s_orig_dtor1(self);
+    if (f) f(self);
 }
 
 /* The OS's global edge swipe-back singleton. Its pointer lives in this .data
@@ -722,14 +750,15 @@ static void hb_surface_teardown(void)
  * app). Tear the app down here, then forward. This is the callback the visibility
  * handler could not provide for a screen transition. */
 typedef void (*exit_fn_t)(void *self, int dst);
-static exit_fn_t s_orig_exit;
+static exit_fn_t s_orig_exit[2];
 
 __attribute__((section(".text.hook"), used, noinline))
 static void hb_exit_hook(void *self, int dst)
 {
     hb_trace_log("XEXIT   ", (uint32_t)(uintptr_t)self, (uint32_t)dst);
+    exit_fn_t f = s_orig_exit[hb_view_kind(self)];
     hb_surface_teardown();
-    if (s_orig_exit) s_orig_exit(self, dst);
+    if (f) f(self, dst);
 }
 
 
@@ -837,20 +866,20 @@ static void hb_install_custom_draw(void *view)
     /* override message handler (vtable slot +0x40) so our heartbeat timer's timer-message
      * drives LVGL on the UI task. Capture the class's real message handler to forward
      * non-timer messages (it may be a subclass override, not view message handler). */
-    s_orig_msg = (msg_fn_t)(uintptr_t)src[MSG_SLOT_OFF / 4u];
+    s_orig_msg[HB_VIEW_CUSTOM] = (msg_fn_t)(uintptr_t)src[MSG_SLOT_OFF / 4u];
     dst[MSG_SLOT_OFF / 4u] = ((uint32_t)(uintptr_t)&hb_msg_hook) | 1u;
-    hb_trace_log("HMINSTL ", (uint32_t)(uintptr_t)s_orig_msg,
+    hb_trace_log("HMINSTL ", (uint32_t)(uintptr_t)s_orig_msg[HB_VIEW_CUSTOM],
                  (uint32_t)(uintptr_t)view);
     /* override both destructors so we stop the heartbeat before the view dies */
-    s_orig_dtor0 = (dtor_t)(uintptr_t)src[DTOR0_SLOT_OFF / 4u];
-    s_orig_dtor1 = (dtor_t)(uintptr_t)src[DTOR1_SLOT_OFF / 4u];
+    s_orig_dtor0[HB_VIEW_CUSTOM] = (dtor_t)(uintptr_t)src[DTOR0_SLOT_OFF / 4u];
+    s_orig_dtor1[HB_VIEW_CUSTOM] = (dtor_t)(uintptr_t)src[DTOR1_SLOT_OFF / 4u];
     dst[DTOR0_SLOT_OFF / 4u] = ((uint32_t)(uintptr_t)&hb_dtor_hook0) | 1u;
     dst[DTOR1_SLOT_OFF / 4u] = ((uint32_t)(uintptr_t)&hb_dtor_hook1) | 1u;
     /* visibility handler(false) on hide -> stop the heartbeat before the view is freed */
-    s_orig_visibility = (vis_fn_t)(uintptr_t)src[VIS_SLOT_OFF / 4u];
+    s_orig_visibility[HB_VIEW_CUSTOM] = (vis_fn_t)(uintptr_t)src[VIS_SLOT_OFF / 4u];
     dst[VIS_SLOT_OFF / 4u] = ((uint32_t)(uintptr_t)&hb_visibility_hook) | 1u;
     /* exit-begin handler -> full teardown when the screen leaves for home (the real signal) */
-    s_orig_exit = (exit_fn_t)(uintptr_t)src[EXIT_SLOT_OFF / 4u];
+    s_orig_exit[HB_VIEW_CUSTOM] = (exit_fn_t)(uintptr_t)src[EXIT_SLOT_OFF / 4u];
     dst[EXIT_SLOT_OFF / 4u] = ((uint32_t)(uintptr_t)&hb_exit_hook) | 1u;
     hb_icache_invalidate(VTABLE_COPY_ADDR, VTABLE_COPY_SIZE);
     *(uint32_t *)view = VTABLE_COPY_ADDR;             /* swap this view's vtable */
@@ -860,8 +889,6 @@ static void hb_install_custom_draw(void *view)
  * apps. Its draw callback (run between the GL view draw's begin-scene/end-scene) renders GL into
  * the view's own GPU pixel buffer on the GPU; the OS composites it into the view tree
  * (sub-rect, clipped, z-ordered) — GL embedded in an app view, not a fullscreen overlay. */
-static uint32_t s_gl_vtable_copy[VTABLE_COPY_SIZE / 4u] __attribute__((aligned(8)));
-#define GL_VTABLE_COPY_ADDR ((uint32_t)(uintptr_t)s_gl_vtable_copy)  /* separate from the custom-draw view's copy */
 #define GLVIEW_CTX_OFF      0x260u        /* the GL view's context field                */
 
 static uint32_t s_gl_frame;
@@ -902,16 +929,16 @@ static void hb_install_gl_draw(void *view)
     for (i = 0; i < VTABLE_COPY_SIZE / 4u; i++)
         dst[i] = src[i];
     dst[DRAW_SLOT_OFF / 4u] = ((uint32_t)(uintptr_t)&gl_draw_hook) | 1u;
-    s_orig_msg = (msg_fn_t)(uintptr_t)src[MSG_SLOT_OFF / 4u];
+    s_orig_msg[HB_VIEW_GL] = (msg_fn_t)(uintptr_t)src[MSG_SLOT_OFF / 4u];
     dst[MSG_SLOT_OFF / 4u] = ((uint32_t)(uintptr_t)&hb_msg_hook) | 1u;
-    s_orig_dtor0 = (dtor_t)(uintptr_t)src[DTOR0_SLOT_OFF / 4u];
-    s_orig_dtor1 = (dtor_t)(uintptr_t)src[DTOR1_SLOT_OFF / 4u];
+    s_orig_dtor0[HB_VIEW_GL] = (dtor_t)(uintptr_t)src[DTOR0_SLOT_OFF / 4u];
+    s_orig_dtor1[HB_VIEW_GL] = (dtor_t)(uintptr_t)src[DTOR1_SLOT_OFF / 4u];
     dst[DTOR0_SLOT_OFF / 4u] = ((uint32_t)(uintptr_t)&hb_dtor_hook0) | 1u;
     dst[DTOR1_SLOT_OFF / 4u] = ((uint32_t)(uintptr_t)&hb_dtor_hook1) | 1u;
-    s_orig_visibility = (vis_fn_t)(uintptr_t)src[VIS_SLOT_OFF / 4u];
+    s_orig_visibility[HB_VIEW_GL] = (vis_fn_t)(uintptr_t)src[VIS_SLOT_OFF / 4u];
     dst[VIS_SLOT_OFF / 4u] = ((uint32_t)(uintptr_t)&hb_visibility_hook) | 1u;
     /* exit-begin handler -> full teardown when the screen leaves for home (the real signal) */
-    s_orig_exit = (exit_fn_t)(uintptr_t)src[EXIT_SLOT_OFF / 4u];
+    s_orig_exit[HB_VIEW_GL] = (exit_fn_t)(uintptr_t)src[EXIT_SLOT_OFF / 4u];
     dst[EXIT_SLOT_OFF / 4u] = ((uint32_t)(uintptr_t)&hb_exit_hook) | 1u;
     hb_icache_invalidate(GL_VTABLE_COPY_ADDR, VTABLE_COPY_SIZE);
     *(uint32_t *)view = GL_VTABLE_COPY_ADDR;
@@ -1059,17 +1086,24 @@ static void hb_app_executable_path(char path[96], const hb_app_launch_t *L,
 static int hb_ensure_app_executable(int slot, const hb_app_launch_t *L)
 {
     char path[96];
+    uint32_t fsize;
     if (s_app_entry[slot])
         return 2;
     hb_app_executable_path(path, L, &s_files[slot]);
-    if (hb_fs_size(path) != s_files[slot].executable_size)
+    fsize = hb_fs_size(path);
+    if (fsize != s_files[slot].executable_size)
         return 0;
+    /* No extra free-block check here: the SDK loader does it (image + 256 KB
+     * against the largest block) and logs HEAVYNO; a second, stricter gate
+     * here would refuse images that fit. */
     s_app_entry[slot] = s_files[slot].standalone ?
         hb_reloc_load_file_verified(path, &s_app_arena[slot], &s_app_code_len[slot],
                                     s_files[slot].executable_hash) :
         hb_reloc_load_file(path, &s_app_arena[slot], &s_app_code_len[slot], 0, 0);
     hb_trace_log("APPLAZY ", (uint32_t)slot,
                  (uint32_t)(uintptr_t)s_app_entry[slot]);
+    if (!s_app_entry[slot])
+        hb_trace_log("HEAVYREF", fsize, hb_os_heap_largest());
     return s_app_entry[slot] ? 1 : 0;
 }
 
@@ -1081,8 +1115,8 @@ static int hb_ensure_app_executable(int slot, const hb_app_launch_t *L)
  * stale instruction lines could execute. Before entering code loaded after any unload,
  * run a 512 KB straight-line sled: every L1 I-cache set (32 KB) is refilled ~64 times
  * with sled lines, which evicts stale lines with overwhelming probability. The sled is
- * allocated once, at the first launch after boot (memory no app code has used), and
- * never changes or moves, so its own cached lines are always correct. */
+ * allocated once, at boot (memory no app code has used), and never changes or
+ * moves, so its own cached lines are always correct. */
 #define HB_SLED_BYTES (512u * 1024u)
 static uint32_t *s_sled;
 static uint8_t   s_sled_failed;
@@ -1093,18 +1127,24 @@ static void hb_sled_init(void)
     uint32_t i, n = HB_SLED_BYTES / 4u;
     if (s_sled || s_sled_failed)
         return;
-    s_sled = (uint32_t *)hb_os_alloc(HB_SLED_BYTES + 32u);
+    /* Ask for exactly 512 KB (no +32 slack: a size-class heap would round
+     * 512 KB + 32 up to the next class) and run the sled from the first 32-byte
+     * line inside it. One line shorter; same eviction. */
+    s_sled = (uint32_t *)hb_os_alloc(HB_SLED_BYTES);
     if (!s_sled) {
         s_sled_failed = 1;
         hb_trace_log("SLEDFAIL", HB_SLED_BYTES, 0);
         return;
     }
-    s_sled = (uint32_t *)(((uintptr_t)s_sled + 31u) & ~(uintptr_t)31u);
+    if ((uintptr_t)s_sled & 31u) {
+        s_sled = (uint32_t *)(((uintptr_t)s_sled + 31u) & ~(uintptr_t)31u);
+        n -= 8u;
+    }
     for (i = 0; i + 1u < n; i++)
         s_sled[i] = 0xE1A00000u;      /* ARM: mov r0, r0 */
     s_sled[n - 1u] = 0xE12FFF1Eu;     /* ARM: bx lr       */
-    hb_icache_invalidate((uint32_t)(uintptr_t)s_sled, HB_SLED_BYTES);
-    hb_trace_log("SLEDINIT", (uint32_t)(uintptr_t)s_sled, HB_SLED_BYTES);
+    hb_icache_invalidate((uint32_t)(uintptr_t)s_sled, n * 4u);
+    hb_trace_log("SLEDINIT", (uint32_t)(uintptr_t)s_sled, n * 4u);
 }
 
 static void hb_icache_sweep(void)
@@ -1236,13 +1276,6 @@ static void hb_app_launch(void *self, const hb_app_launch_t *L)
     }
 }
 
-static int hb_same_bytes(const void *a, const void *b, uint32_t n)
-{
-    const uint8_t *p = a, *q = b;
-    while (n--) if (*p++ != *q++) return 0;
-    return 1;
-}
-
 static uint32_t hb_pack_size(const void *pack)
 {
     const hb_app_pack_t *h = pack;
@@ -1261,31 +1294,59 @@ static uint32_t hb_pack_size(const void *pack)
  * cached executables. Label nodes and icon extension are reused; retain at most
  * the current and one retired catalog for queued UI teardown. App file changes
  * need no reboot; replacing the resident itself still requires a restart. */
+static uint32_t s_live_sum;       /* FNV-1a of the live catalog as loaded (before registration) */
+
+/* Catalogs are compared by a checksum taken before registration: once
+ * registered, the OS may touch the live pack's bytes, and a byte compare would
+ * then call every rescan "changed" and retain a fresh catalog each time. */
+static uint32_t hb_catalog_sum(const void *pack, const hb_app_files_t *files, uint32_t count)
+{
+    const uint8_t *p = pack;
+    uint32_t h = 0x811c9dc5u, n = hb_pack_size(pack), i;
+    for (i = 0; i < n; i++) h = (h ^ p[i]) * 0x01000193u;
+    p = (const uint8_t *)files;
+    for (i = 0; i < count * (uint32_t)sizeof(files[0]); i++) h = (h ^ p[i]) * 0x01000193u;
+    return h;
+}
+
+/* Unload every app (aux block first, then images). 0 if code is loaded but the
+ * I-cache sled is unavailable, so a later launch could not run safely. */
+static int hb_unload_for_refresh(void)
+{
+    uint32_t i;
+    int loaded = 0;
+    for (i = 0; i < (uint32_t)g_launch_count; i++) if (s_app_arena[i]) loaded = 1;
+    if (loaded) {
+        hb_sled_init();
+        if (!s_sled) return 0;
+        hb_surface_drain_pending();
+        hb_free_app_aux();
+    }
+    s_shared.prepare_unload = 0;
+    hb_unload_other_apps(-1);
+    return 1;
+}
+
 static int hb_refresh_apps(int returning_home)
 {
     void *next;
-    uint32_t i, j, count;
+    uint32_t i, j, count, sum;
     int changed;
     if (s_refreshing || !s_apps_loaded || !hb_fs_is_dir("/iPod_Control")) return 0;
     if (s_cur_app_id || (s_shared.prepare_unload && !s_shared.prepare_unload())) return 0;
     s_refreshing = 1;
+    /* Back on Home every app is unloaded anyway. Do it BEFORE the scan: the
+     * scan's blocks (and a retained catalog, if it changed) would otherwise sit
+     * beside the quitting app's arena and split the big free block once that
+     * arena is freed. From nano7kit by Shimku (MIT). */
+    if (returning_home && !hb_unload_for_refresh()) { s_refreshing = 0; return 0; }
     next = hb_app_catalog_load(APP_DISK_PATH, s_resident_version, s_next_files, hb_trace_log);
     if (!next) { s_refreshing = 0; return 0; }
     count = ((const hb_app_pack_t *)next)->count;
-    changed = !s_live_pack || hb_pack_size(next) != hb_pack_size(s_live_pack) ||
-        !hb_same_bytes(next, s_live_pack, hb_pack_size(next)) ||
-        !hb_same_bytes(s_files, s_next_files, count * sizeof(s_files[0]));
-    if (changed || returning_home) {
-        int loaded = 0;
-        for (i = 0; i < (uint32_t)g_launch_count; i++) if (s_app_arena[i]) loaded = 1;
-        if (loaded) {
-            hb_sled_init();
-            if (!s_sled) { hb_os_free(next); s_refreshing = 0; return 0; }
-            hb_surface_drain_pending();
-            hb_free_app_aux();
-        }
-        s_shared.prepare_unload = 0;
-        hb_unload_other_apps(-1);
+    sum = hb_catalog_sum(next, s_next_files, count);
+    changed = !s_live_pack || sum != s_live_sum;
+    if (changed && !returning_home && !hb_unload_for_refresh()) {
+        hb_os_free(next); s_refreshing = 0; return 0;
     }
     if (!changed) {
         if (returning_home) {
@@ -1305,6 +1366,7 @@ static int hb_refresh_apps(int returning_home)
         if (j == count) hb_silver_home_hide_item(g_launch[i].sbid);
     }
     for (i = 0; i < count; i++) s_files[i] = s_next_files[i];
+    s_live_sum = sum;
     g_launch_count = hb_app_register_pack(next, hb_os_alloc, hb_trace_log,
         g_launch, HB_MAX_APPS, SILVERDB_OBJ, SILVERDB_NODE,
         hb_silver_icon_live() ? 2 : 1, s_files);
@@ -1483,10 +1545,20 @@ static int action_hook(void *self, const char *name, void *msg)
          * (hb_silver_icon_live): never extend the cache twice. The untethered
          * loader runs us once per boot, when the cache has just been reset. */
         int reg = !hb_silver_icon_live();
+        /* The two blocks the resident keeps for the whole boot
+         * (I-cache sled, LVGL framebuffer) are taken now, with the other boot
+         * blocks, instead of at the first launch, where they landed beside
+         * that app's arena and split the big free block once it was freed. */
+        hb_sled_init();
+        if (!s_fb)
+            s_fb = (uint32_t *)hb_os_alloc(FB_W * FB_H * 4u);
+        hb_trace_log("BOOTBLK ", (uint32_t)(uintptr_t)s_sled, (uint32_t)(uintptr_t)s_fb);
         /* Merge independent disk manifests before the single batched registrar
          * call. No shared catalog rewrite is needed to install a prebuilt app. */
         const void *pack = hb_app_catalog_load(APP_DISK_PATH, s_resident_version, s_files, hb_trace_log);
         s_live_pack = (void *)pack;
+        if (pack)
+            s_live_sum = hb_catalog_sum(pack, s_files, ((const hb_app_pack_t *)pack)->count);
         if (pack)
             g_launch_count = hb_app_register_pack(pack,
                                 hb_os_alloc,    /* nothrow; every callee NULL-checks */
